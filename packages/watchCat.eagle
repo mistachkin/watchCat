@@ -1,0 +1,631 @@
+###############################################################################
+#
+# watchCat.eagle --
+#
+# Extensible Adaptable Generalized Logic Engine (Eagle)
+# Log File Monitoring Tool Helpers
+#
+# Copyright (c) 2007-2012 by Joe Mistachkin.  All rights reserved.
+#
+# See the file "license.terms" for information on usage and redistribution of
+# this file, and for a DISCLAIMER OF ALL WARRANTIES.
+#
+# RCS: @(#) $Id: $
+#
+###############################################################################
+
+#
+# NOTE: Use our own namespace here because even though we do not directly
+#       support namespaces ourselves, we do not want to pollute the global
+#       namespace if this script actually ends up being evaluated in Tcl.
+#
+# WARNING: Do not call any of these procedures unless you know exactly how
+#          they work and are willing to accept broken script compatibility
+#          later.  You have been warned.
+#
+namespace eval ::Eagle {
+  proc preDisposeCallbackForWatchCat { object } {; # EComPD.DisposeCallback
+    #
+    # NOTE: First, remove the event handler that called this procedure.
+    #
+    catch {object removecallback [lindex [info level [info level]] 0]}
+
+    #
+    # NOTE: Next, restore saved [getTestLog] core script library procedure.
+    #
+    hookGetTestLogForWatchCat false false false
+
+    #
+    # NOTE: Next, restore saved [newTestLog] core script library procedure.
+    #
+    hookNewTestLogForWatchCat false false false
+
+    #
+    # NOTE: Next, kill external log monitor process, if it is still running.
+    #
+    cleanupForWatchCat
+
+    #
+    # NOTE: Finally, unhook this event handler as it will never be invoked
+    #       again (i.e. because the entire interpreter is disposing).
+    #
+    hookPreDisposeCallbackForWatchCat false
+  }
+
+  proc getCallerNameForWatchCat {} {
+    #
+    # NOTE: This procedure returns the name of the procedure
+    #       that called our caller, hence the minus two value
+    #       for the level argument.
+    #
+    if {[catch {lindex [info level -2] 0} result] == 0} then {
+      return $result
+    } else {
+      return ""
+    }
+  }
+
+  proc cleanupForWatchCat { {quiet false} } {
+    try {
+      if {[checkProcessIdForWatchCat pid true]} then {
+        if {[catch {
+          kill -force -- [set pid $pid]
+        } error] == 0} then {
+          if {!$quiet} then {
+            host result Ok [appendArgs \
+                ">>>> killed external log monitor, process " $pid .\n]
+          }
+
+          return true
+        } else {
+          if {!$quiet} then {
+            host result Ok [appendArgs \
+                ">>>> failed to kill external log monitor process: " \
+                $error \n]
+          }
+        }
+      } else {
+        if {!$quiet} then {
+          host result Ok ">>>> missing external log monitor process.\n"
+        }
+      }
+
+      return false
+    } finally {
+      #
+      # HACK: This element should have been unset via the helper
+      #       procedure [checkProcessIdForWatchCat], just above.
+      #
+      if {[info exists ::eagle_debugger(watchCatProcessId)]} then {
+        if {!$quiet} then {
+          host result Ok [appendArgs \
+              ">>>> found stale external log monitor process " \
+              "variable " $::eagle_debugger(watchCatProcessId) \
+              ", which will be cleaned up\n"]
+        }
+
+        unset -nocomplain ::eagle_debugger(watchCatProcessId)
+      }
+
+      unset -nocomplain ::eagle_debugger(watchCatPersistent)
+      unset -nocomplain ::eagle_debugger(watchCatCommand)
+      unset -nocomplain ::eagle_debugger(watchCatFailSafe)
+      unset -nocomplain ::eagle_debugger(watchCatAggressive)
+      unset -nocomplain ::eagle_debugger(watchCatVerbose)
+      unset -nocomplain ::eagle_debugger(watchCatLimit)
+    }
+  }
+
+  proc isHookedGetTestLogForWatchCat { hooked } {
+    if {$hooked} then {
+      if {[llength [info procs getTestLog]] > 0 && \
+          [llength [info procs __getTestLog]] > 0 && \
+          [llength [info procs getTestLogForWatchCat]] == 0} then {
+        return true
+      }
+    } else {
+      if {[llength [info procs getTestLog]] > 0 && \
+          [llength [info procs __getTestLog]] == 0 && \
+          [llength [info procs getTestLogForWatchCat]] > 0} then {
+        return true
+      }
+    }
+
+    return false
+  }
+
+  proc hookGetTestLogForWatchCat {
+          enable {failSafe ""} {strict false} {quiet false} } {
+    if {[string is boolean -strict $failSafe]} then {
+      set ::eagle_debugger(watchCatFailSafe) $failSafe
+    }
+
+    if {$enable} then {
+      if {[isHookedGetTestLogForWatchCat false]} then {
+        rename getTestLog __getTestLog; # save original
+        rename getTestLogForWatchCat getTestLog; # override
+
+        if {!$quiet} then {
+          host result Ok ">>>> hooked \[getTestLog\] successfully.\n"
+        }
+
+        return true
+      } else {
+        set message "cannot hook, saved \[getTestLog\] may be present"
+
+        if {$strict} then {
+          error $message
+        } elseif {!$quiet} then {
+          host result Ok [appendArgs ">>>> " $message .\n]
+        }
+      }
+    } else {
+      if {[isHookedGetTestLogForWatchCat true]} then {
+        rename getTestLog getTestLogForWatchCat; # unoverride
+        rename __getTestLog getTestLog; # restore original
+
+        if {!$quiet} then {
+          host result Ok ">>>> unhooked \[getTestLog\] successfully.\n"
+        }
+
+        return true
+      } else {
+        set message "cannot unhook, saved \[getTestLog\] may be absent"
+
+        if {$strict} then {
+          error $message
+        } elseif {!$quiet} then {
+          host result Ok [appendArgs ">>>> " $message .\n]
+        }
+      }
+    }
+
+    return false
+  }
+
+  proc isHookedNewTestLogForWatchCat { hooked } {
+    if {$hooked} then {
+      if {[llength [info procs newTestLog]] > 0 && \
+          [llength [info procs __newTestLog]] > 0 && \
+          [llength [info procs newTestLogForWatchCat]] == 0} then {
+        return true
+      }
+    } else {
+      if {[llength [info procs newTestLog]] > 0 && \
+          [llength [info procs __newTestLog]] == 0 && \
+          [llength [info procs newTestLogForWatchCat]] > 0} then {
+        return true
+      }
+    }
+
+    return false
+  }
+
+  proc hookNewTestLogForWatchCat { enable {strict false} {quiet false} } {
+    if {$enable} then {
+      if {[isHookedNewTestLogForWatchCat false]} then {
+        rename newTestLog __newTestLog; # save original
+        rename newTestLogForWatchCat newTestLog; # override
+
+        if {!$quiet} then {
+          host result Ok ">>>> hooked \[newTestLog\] successfully.\n"
+        }
+
+        return true
+      } else {
+        set message "cannot hook, saved \[newTestLog\] may be present"
+
+        if {$strict} then {
+          error $message
+        } elseif {!$quiet} then {
+          host result Ok [appendArgs ">>>> " $message .\n]
+        }
+      }
+    } else {
+      if {[isHookedNewTestLogForWatchCat true]} then {
+        rename newTestLog newTestLogForWatchCat; # unoverride
+        rename __newTestLog newTestLog; # restore original
+
+        if {!$quiet} then {
+          host result Ok ">>>> unhooked \[newTestLog\] successfully.\n"
+        }
+
+        return true
+      } else {
+        set message "cannot unhook, saved \[newTestLog\] may be absent"
+
+        if {$strict} then {
+          error $message
+        } elseif {!$quiet} then {
+          host result Ok [appendArgs ">>>> " $message .\n]
+        }
+      }
+    }
+
+    return false
+  }
+
+  proc hookPreDisposeCallbackForWatchCat { enable {quiet false} } {
+    set interpreter [object invoke -alias Interpreter GetActive]
+
+    if {[isNonNullObjectHandle $interpreter]} then {
+      set script preDisposeCallbackForWatchCat
+
+      object invoke -flags +NonPublic $interpreter \
+          remove_PreInterpreterDisposed $script
+
+      if {$enable} then {
+        object invoke -flags +NonPublic $interpreter \
+            add_PreInterpreterDisposed $script
+
+        if {!$quiet} then {
+          host result Ok ">>>> hooked PreInterpreterDisposed event.\n"
+        }
+      } else {
+        if {!$quiet} then {
+          host result Ok ">>>> unhooked PreInterpreterDisposed event.\n"
+        }
+      }
+    }
+  }
+
+  proc isFailSafeForWatchCat {} {
+    if {[info exists ::eagle_debugger(watchCatFailSafe)]} then {
+      set value $::eagle_debugger(watchCatFailSafe)
+
+      if {[string is boolean $value]} then {
+        return $value
+      }
+    }
+
+    return false
+  }
+
+  proc checkProcessIdForWatchCat { {varName ""} {unset false} } {
+    if {[string length $varName] > 0} then {
+      upvar 1 $varName pid
+    }
+
+    if {[info exists ::eagle_debugger(watchCatProcessId)]} then {
+      set pid $::eagle_debugger(watchCatProcessId)
+
+      if {$unset} then {
+        unset -nocomplain ::eagle_debugger(watchCatProcessId)
+      }
+
+      return true
+    }
+
+    return false
+  }
+
+  proc isOfficialStableReleaseInProgressForWatchCat {} {
+    if {[llength [info commands \
+        isOfficialStableReleaseInProgress]] == 0} then {
+      return false
+    }
+
+    return [isOfficialStableReleaseInProgress]
+  }
+
+  proc getTestChannelOrDefaultForWatchCat { {channel stdout} } {
+    if {[llength [info commands getTestChannelOrDefault]] == 0} then {
+      return $channel
+    }
+
+    return [getTestChannelOrDefault $channel]
+  }
+
+  proc setupTestRunTagForWatchCat { {channel stdout} {quiet false} } {
+    if {[llength [info commands setupTestRunTag]] == 0} then {
+      return false
+    }
+
+    return [setupTestRunTag $channel $quiet]
+  }
+
+  proc shouldExecForWatchCat {} {
+    if {[info exists ::no(shouldExecForWatchCat)]} then {
+      return false
+    }
+
+    #
+    # BUGFIX: Do not attempt to launch a(nother) shell if
+    #         our current shell executable name is not one
+    #         that is "well-known" to be ours alone.
+    #
+    if {![regexp -- \
+        {^Eagle(?:Kit|Shell)?(?:32|64)?\.(?:dll|exe)$} \
+        [file tail [getShellExecutableName]]]} then {
+      return false
+    }
+
+    if {![checkProcessIdForWatchCat pid]} then {
+      return true
+    }
+
+    if {![isFailSafeForWatchCat]} then {
+      return false
+    }
+
+    if {![isActiveProcess $pid]} then {
+      return true
+    }
+
+    return false
+  }
+
+  proc getPathForWatchCat {} {
+    if {![info exists ::env(SCRATCH_ROOT)]} then {
+      error "environment variable SCRATCH_ROOT not found"
+    }
+
+    set path $::env(SCRATCH_ROOT)
+
+    if {![file exists $path] || ![file isdirectory $path]} then {
+      error "bad path in environment variable SCRATCH_ROOT"
+    }
+
+    return $path
+  }
+
+  proc getFileNameForWatchCat { path } {
+    set fileNameOnly watchCat.tool.eagle
+
+    if {[info exists ::env(XDG_WATCHCAT_HOME)]} then {
+      return [file normalize [file join \
+          $::env(XDG_WATCHCAT_HOME) $fileNameOnly]]
+    } elseif {[info exists ::env(XDG_STARTUP_HOME)]} then {
+      return [file normalize [file join \
+          $::env(XDG_STARTUP_HOME) Scripts Public WatchCat \
+          $fileNameOnly]]
+    } else {
+      return [file normalize [file join $path $fileNameOnly]]
+    }
+  }
+
+  proc getCommandForWatchCat { scriptFileName logFileName } {
+    #
+    # NOTE: If the script command used to start the external
+    #       log monitor is not yet setup, do that now.
+    #
+    if {![info exists ::eagle_debugger(watchCatCommand)]} then {
+      #
+      # NOTE: Initially, there is no "-preInitialize" script.
+      #       This is allowed because any script, including
+      #       command line arguments, may be an empty string.
+      #
+      set preInitialize ""
+
+      if {[isOfficialStableReleaseInProgressForWatchCat]} then {
+        #
+        # NOTE: If an official stable release is currently
+        #       in progress, prevent this test process from
+        #       actually being killed (i.e. the external log
+        #       monitor will operate in "report only" mode).
+        #
+        if {[string length $preInitialize] > 0} then {
+          append preInitialize {; }
+        }
+
+        append preInitialize [list set no(killHungProcess) 1]
+      }
+
+      if {[info exists ::eagle_debugger(watchCatLimit)]} then {
+        #
+        # NOTE: Override the default limit for the external
+        #       log monitor.
+        #
+        if {[string length $preInitialize] > 0} then {
+          append preInitialize {; }
+        }
+
+        append preInitialize [list \
+            set limit $::eagle_debugger(watchCatLimit)]
+      }
+
+      if {[info exists ::eagle_debugger(watchCatAggressive)]} then {
+        #
+        # NOTE: Override the default "aggressive" mode for the
+        #       external log monitor.
+        #
+        if {[string length $preInitialize] > 0} then {
+          append preInitialize {; }
+        }
+
+        append preInitialize [list \
+            set aggressive $::eagle_debugger(watchCatAggressive)]
+      }
+
+      if {[info exists ::eagle_debugger(watchCatVerbose)]} then {
+        #
+        # NOTE: Override the default "verbose" mode for the
+        #       external log monitor.
+        #
+        if {[string length $preInitialize] > 0} then {
+          append preInitialize {; }
+        }
+
+        append preInitialize [list \
+            set verbose $::eagle_debugger(watchCatVerbose)]
+      }
+
+      #
+      # NOTE: Build an appropriate launch command for the
+      #       external log monitor.
+      #
+      set ::eagle_debugger(watchCatCommand) \
+          [list execShell [list -nopreviousprocessid] \
+          -noArgumentsFileNames \
+          -preInitialize [appendArgs \" $preInitialize \"] \
+          -file [appendArgs \" $scriptFileName \"] \
+          [appendArgs \" $logFileName \"] [pid] &]
+    }
+
+    return $::eagle_debugger(watchCatCommand)
+  }
+
+  proc canHasDefaultTestLogForWatchCat { caller varName } {
+    if {[string length $varName] > 0} then {
+      upvar 1 $varName log
+    }
+
+    set level [lindex [info level [info level]] 0]
+
+    if {[info exists ::eagle_debugger($level)]} then {
+      #
+      # HACK: This procedure has previously returned the
+      #       default log.  It may be that the log (file)
+      #       has been explicitly disabled by the caller;
+      #       therefore, make no further attempts to use
+      #       the default log.
+      #
+      return true
+    }
+
+    if {[string trimleft $caller :] eq "tlog"} then {
+      package require Eagle.Test
+      set log [set ::eagle_debugger($level) [getDefaultTestLog]]
+      return true
+    }
+
+    return false
+  }
+
+  proc newTestLogForWatchCat { oldFileName newFileName } {
+    #
+    # HACK: Since there is direct no way to communicate the
+    #       new log file name (System.Data.SQLite?) to the
+    #       external log monitor process, just kill it now.
+    #
+    host result Ok [appendArgs \
+        ">>>> NOTIFIED OF NEW LOG FILE: " $newFileName \n]
+
+    #
+    # HACK: Cleanup any sub-directories underneath the log
+    #       file "root" directory, e.g. TEMP, etc.  So, we
+    #       should remove "logs" and "2024-07-04", beneath
+    #       the TEMP directory, but only when they are now
+    #       empty.
+    #
+    catch {
+      package require Eagle.Test
+      removeTemporarySubDirectories [file dirname $oldFileName]
+    }
+
+    #
+    # HACK: This will kill the external log monitor process,
+    #       which is not ideal.  Ideally, we should want to
+    #       notify the external log monitor process of the
+    #       actual new log file name to monitor.  In theory,
+    #       the fail-safe option being enabled will cause a
+    #       new external log monitor process to be started.
+    #
+    cleanupForWatchCat
+  }
+
+  proc getTestLogForWatchCat {} {
+    set caller [getCallerNameForWatchCat]
+
+    if {[llength [info procs __getTestLog]] == 0} then {
+      error [appendArgs \
+          "saved \[getTestLog\] not found via caller: " \
+          $caller]
+    }
+
+    set result [__getTestLog]
+
+    if {[string length $result] == 0} then {
+      if {![canHasDefaultTestLogForWatchCat $caller result]} then {
+        error [appendArgs \
+            "bad saved \[getTestLog\] result via caller: " \
+            $caller]
+      }
+    }
+
+    if {[string length $result] > 0} then {
+      #
+      # NOTE: Figure out where to send diagnostic output, if any.
+      #       Ideally, there should be none, or extremely minimal.
+      #
+      set channel [getTestChannelOrDefaultForWatchCat]
+
+      #
+      # NOTE: Make sure the "tag" value to be included within the
+      #       HTTP User-Agent (i.e. for remote logging) is setup,
+      #       if possible.  Do this quietly, for now.  This is an
+      #       issue because if a test (e.g. "stress-1.1") creates
+      #       a lot of threads that (also) emit information to the
+      #       test log, things will get messy fast.
+      #
+      setupTestRunTagForWatchCat $channel true; # NOISY (SDS-only?)
+
+      if {[shouldExecForWatchCat]} then {
+        #
+        # NOTE: Verify and obtain the path where the external log
+        #       monitor tool script file can be found.
+        #
+        set fileName [getFileNameForWatchCat \
+            [set path [getPathForWatchCat]]]
+
+        if {[file exists $fileName]} then {
+          #
+          # NOTE: Attempt to execute a nested shell instance
+          #       with an auxiliary tool script that monitors
+          #       our test log file for changes to make sure
+          #       this process does not hang forever.
+          #
+          set command [getCommandForWatchCat $fileName $result]
+
+          if {[string length $command] > 0} then {
+            #
+            # HACK: If the external log monitor process should
+            #       be allowed to run until it exits, skip its
+            #       disposal when cleaning up the interpreter.
+            #
+            if {![info exists \
+                ::eagle_debugger(watchCatPersistent)]} then {
+              #
+              # NOTE: Before launching the external log monitor
+              #       process, arrange for it to be claned up.
+              #
+              hookPreDisposeCallbackForWatchCat true
+            }
+
+            if {[catch $command \
+                ::eagle_debugger(watchCatProcessId)]} then {
+              #
+              # HACK: For pre-Beta 55 builds of Eagle, remove
+              #       the (new) "-nopreviousprocessid" option.
+              #
+              set command [string map \
+                  [list -nopreviousprocessid \{\}] $command]
+
+              set ::eagle_debugger(watchCatProcessId) [eval $command]
+            }
+
+            set message [appendArgs \
+                "started external log monitor, process " \
+                $::eagle_debugger(watchCatProcessId)]
+
+            tqputs $channel [appendArgs "---- " $message \n]
+            host result Ok [appendArgs ">>>> " $message \n]
+          }
+        }
+      }
+    }
+
+    #
+    # NOTE: Finally, make sure to actually return the test
+    #       log file name.
+    #
+    return $result
+  }
+
+  #
+  # NOTE: Provide the Eagle "watchcat" package to the interpreter.
+  #
+  package provide Eagle.WatchCat \
+    [expr {[isEagle] ? [info engine PatchLevel] : "1.0"}]
+}
+

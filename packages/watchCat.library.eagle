@@ -1,0 +1,946 @@
+###############################################################################
+#
+# watchCat.library.eagle --
+#
+# Extensible Adaptable Generalized Logic Engine (Eagle)
+# Log File Monitoring Library
+#
+# Copyright (c) 2007-2012 by Joe Mistachkin.  All rights reserved.
+#
+# See the file "license.terms" for information on usage and redistribution of
+# this file, and for a DISCLAIMER OF ALL WARRANTIES.
+#
+# RCS: @(#) $Id: $
+#
+###############################################################################
+
+#
+# NOTE: Use our own namespace here because even though we do not directly
+#       support namespaces ourselves, we do not want to pollute the global
+#       namespace if this script actually ends up being evaluated in Tcl.
+#
+namespace eval ::Eagle {
+  #
+  # NOTE: This procedure runs the specified script in the context of the
+  #       caller -AND- catches errors from it, optionally reporting them.
+  #
+  proc catchAndMaybeLog { fileName stage varName script } {
+    if {[catch {uplevel 1 $script} error]} then {
+      if {[string length $varName] > 0} then {
+        upvar 1 $varName changed
+      }
+
+      if {![info exists ::no(logLocalError)]} then {
+        logElapsedLocalEvent ERROR $fileName $stage changed $error
+      }
+
+      if {![info exists ::no(logRemoteError)]} then {
+        logElapsedRemoteEvent ERROR $fileName $stage changed $error
+      }
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to increment the logging change counter.
+  #       It returns non-zero if the logging change counter existed prior
+  #       to the increment.
+  #
+  proc shouldCountAsLogged { varName {increment 0} } {
+    if {[string length $varName] > 0} then {
+      upvar 1 $varName changed
+    }
+
+    if {[info exists changed(logged)]} then {
+      if {[string is integer -strict $increment]} then {
+        incr changed(logged) $increment
+      }
+
+      return true
+    } else {
+      if {[string is integer -strict $increment]} then {
+        set changed(logged) $increment
+      }
+
+      return false
+    }
+  }
+
+  #
+  # NOTE: This procedure is designed to emit the specified trace message
+  #       using the highest trace priority available.
+  #
+  proc traceMessage { message } {
+    if {[llength [info commands dtrace]] > 0} then {
+      dtrace $message
+    } else {
+      debug trace -- $message
+    }
+  }
+
+  #
+  # NOTE: This procedure arranges for cleanup to be performed when this
+  #       tool is exiting, due to unloading of the current AppDomain or
+  #       exiting of the current process.  Most of this code was stolen
+  #       from the [hookPreDisposeCallbackForWatchCat] procedure within
+  #       the associated "eagle/startup/watchCat.eagle" script file.
+  #
+  proc hookForCleanup { enable {quiet false} } {
+    set script [list apply [list [list object] {; # EComPD.DisposeCallback
+      #
+      # HACK: Remove event handler that called this procedure.  This
+      #       cleanup command has been designed for use with [apply]
+      #       by ignoring arguments after the body of the anonymous
+      #       procedure.
+      #
+      catch {
+        object removecallback [lrange [info level [info level]] 0 1]
+      }
+
+      #
+      # NOTE: Does cleanup still appear to be required?
+      #
+      if {[info exists ::cleanup] && \
+          [string is true -strict $::cleanup]} then {
+        #
+        # HACK: The cleanup script must be completely fault tolerant.
+        #       It cannot make any assumptions about global state.
+        #
+        if {[info exists ::fileName] && \
+            [info exists ::pid] && [info exists ::dead]} then {
+          logHungProcess $::fileName cleanup ::changed
+          killHungProcess $::fileName $::pid ::dead cleanup
+        }
+      }
+    }]]
+
+    set interpreter [object invoke -alias Interpreter GetActive]
+
+    if {[isNonNullObjectHandle $interpreter]} then {
+      $interpreter -flags +NonPublic \
+          remove_PreInterpreterDisposed $script
+
+      if {$enable} then {
+        $interpreter -flags +NonPublic \
+            add_PreInterpreterDisposed $script
+
+        if {!$quiet} then {
+          host result Ok ">>>> hooked PreInterpreterDisposed event.\n"
+        }
+      } else {
+        if {!$quiet} then {
+          host result Ok ">>>> unhooked PreInterpreterDisposed event.\n"
+        }
+      }
+    }
+  }
+
+  #
+  # NOTE: This procedure checks for an existing file that sits alongside the
+  #       specified path with a particular tag suffix.  Non-zero is returned
+  #       only if the specified tagged (a.k.a. "stop") file exists.
+  #
+  proc checkForTaggedPath { tag {path ""} } {
+    if {[string length $path] == 0} then {
+      set path [getTestLog]
+
+      if {[string length $path] == 0} then {
+        set path [info script]
+      }
+    }
+
+    if {[string length $path] > 0 && [string length $tag] > 0 && \
+        [file exists $path] && \
+        [regexp -nocase -- {^[0-9A-Z]{4,}$} $tag] && \
+        [file exists [appendArgs $path . $tag]]} then {
+      return true
+    } else {
+      return false
+    }
+  }
+
+  #
+  # NOTE: This procedure returns non-zero if the specified process appears
+  #       to be running.  This procedure assumes there is an external tool
+  #       provided by the operating system named "kill" that is compatible
+  #       with POSIX.  If this assumption does not hold, the results are
+  #       undefined.
+  #
+  proc isProcessRunning { pid } {
+    if {[isWindows]} then {
+      return [isActiveProcess $pid]
+    } else {
+      return [expr {[catch {
+        exec -success Success -- kill -0 $pid; # POSIX
+      }] == 0}]
+    }
+  }
+
+  #
+  # NOTE: This procedure returns non-zero if the specified file has changed
+  #       (according to its file system modification time) since it was last
+  #       checked.  The first call for a particular file will always return
+  #       true.  Subsequent calls will only return true if the modification
+  #       time is greater than the last time it was checked.
+  #
+  proc hasFileChanged { fileName {varName ""} } {
+    if {[string length $varName] > 0} then {
+      upvar 1 $varName changed
+    }
+
+    set mtime [file mtime $fileName]
+
+    if {[info exists changed($fileName)]} then {
+      set result [expr {$changed($fileName) != $mtime}]
+    } else {
+      set result true
+    }
+
+    set changed($fileName) $mtime
+    return $result
+  }
+
+  #
+  # NOTE: This procedure returns non-zero if the specified file is unchanged
+  #       -OR- has been changed too far in the past (i.e. it is stale and the
+  #       associated process should be assumed to be hung).
+  #
+  proc isProcessHung { limit fileName {varName ""} {quiet false} } {
+    if {[string length $varName] > 0} then {
+      upvar 1 $varName changed
+    }
+
+    set level [lindex [info level [info level]] 0]
+
+    if {![info exists changed($fileName)]} then {
+      if {!$quiet} then {
+        debug output [appendArgs \
+            "ERROR " $level ": missing mtime for log file \"" \
+            $fileName \"]
+      }
+
+      return true
+    }
+
+    set now [clock seconds]
+    set mtime $changed($fileName)
+    set elapsed [set changed(elapsed) [expr {$now - $mtime}]]
+
+    if {$elapsed > $limit} then {
+      if {!$quiet} then {
+        debug output [appendArgs \
+            "ERROR " $level ": stale mtime " $mtime " for log file \"" \
+            $fileName "\" is from " $elapsed " seconds ago, which is " \
+            "more than " $limit " seconds ago"]
+      }
+
+      return true
+    }
+
+    return false
+  }
+
+  #
+  # NOTE: This procedure attempts to extract the test run identifier -AND-
+  #       command line from the specified log file.
+  #
+  proc getTestRunDataFromLogFile { fileName } {
+    set result [list]
+
+    if {[file exists $fileName]} then {
+      set pattern(1) {^\*\*\*\* START OF TEST LOG "([0-9A-F]+)" \*\*\*\*$}
+      set pattern(2) {^---- original command line: (.*)$}
+
+      set data [string map [list \r\n \n] [readSharedFile $fileName]]
+
+      lappend result TEST-RUN
+
+      if {![regexp -skip 1 -line -- $pattern(1) $data testRun]} then {
+        set testRun <unknown>
+      }
+
+      lappend result $testRun
+      lappend result CMD-LINE
+
+      if {![regexp -skip 1 -line -- $pattern(2) $data cmdLine]} then {
+        set cmdLine <unknown>
+      }
+
+      lappend result $cmdLine
+    }
+
+    return $result
+  }
+
+  #
+  # NOTE: This procedure attempts to extract the current pending test name
+  #       from the specified log file.
+  #
+  proc getPendingTestFromLogFile { fileName } {
+    if {[file exists $fileName]} then {
+      #
+      # HACK: These patterns make various assumptions about how the
+      #       test suite log files are structured and formatted.
+      #
+      #       The "truth statements" being made by these patterns
+      #       being matched here are:
+      #
+      #       1. Find the last line within the test log data that
+      #          contains a "test was started" indicator and then
+      #          extract that test name.
+      #
+      #       2. Using that test name, attempt to find a matching
+      #          (final) status of the test, which must be one of
+      #          the following:
+      #
+      #          A. The test was skipped for some reason, e.g. by
+      #             not meeting one of more of its associated test
+      #             constraints, etc.
+      #
+      #          B. The test has run and PASSED -OR- it has been
+      #             explicitly disabled (e.g. via -whatIf option)
+      #             and will not be run.
+      #
+      #          C. The test has run and FAILED -OR- its failure
+      #             has been explicitly ignored (e.g. via the
+      #             special "fail.false" test constraint, etc).
+      #
+      #       If a match is found for #1 and not for #2A, #2B,
+      #       or #2C, then that test is still pending its final
+      #       status, and that test name that will be returned
+      #       from this procedure; otherwise, an empty string
+      #       will be returned.
+      #
+      set pattern(1) {^---- ([0-9A-Za-z]+-?\d+(?:\.\d+)*) start$}
+      set pattern(2) {^\+\+\+\+ %testName% SKIPPED:\s+[^\r\n]+$}
+      set pattern(3) {^\+\+\+\+ %testName% (?:PASSED|DISABLED)$}
+      set pattern(4) {^==== %testName% (?:FAILED|IGNORED)$}
+
+      set data [string map [list \r\n \n] [readSharedFile $fileName]]
+      set starts [regexp -all -inline -line -skip 1 -- $pattern(1) $data]
+
+      if {[llength $starts] > 0} then {
+        set testName(1) [lindex $starts end]; # last test in file
+        set testName(2) [string map [list . \\.] $testName(1)]
+
+        if {![regexp -line -- [string map [list %testName% \
+                $testName(2)] $pattern(2)] $data] && \
+            ![regexp -line -- [string map [list %testName% \
+                $testName(2)] $pattern(3)] $data] && \
+            ![regexp -line -- [string map [list %testName% \
+                $testName(2)] $pattern(4)] $data]} then {
+          return $testName(1)
+        }
+      }
+    }
+
+    return ""
+  }
+
+  #
+  # NOTE: This procedure attempts to extract information from the specified
+  #       log file, including but not limited to: the test run identifier,
+  #       the command line, and the current pending test name.
+  #
+  proc getLogFileStatus { fileName } {
+    if {[file exists $fileName]} then {
+      set result [list]
+      set errors [list]
+
+      if {[catch {file size $fileName} size] == 0} then {
+        lappend result size $size
+      } else {
+        lappend errors size $size
+      }
+
+      if {[catch {file mtime $fileName} mtime] == 0} then {
+        lappend result mtime $mtime
+      } else {
+        lappend errors mtime $mtime
+      }
+
+      if {[catch {
+        getTestRunDataFromLogFile $fileName
+      } testRunData] == 0} then {
+        if {[llength $testRunData] > 0} then {
+          eval lappend result $testRunData
+        }
+      } else {
+        lappend errors task $testRunData
+      }
+
+      if {[catch {
+        getPendingTestFromLogFile $fileName
+      } pending] == 0} then {
+        if {[string length $pending] > 0} then {
+          lappend result pending $pending
+        } else {
+          lappend result pending <none>
+        }
+      } else {
+        lappend errors pending $pending
+      }
+
+      if {[llength $errors] > 0} then {
+        lappend result errors $errors
+      }
+
+      return $result
+    } else {
+      return <missing>
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to remove the test run identifier from
+  #       the specified value.
+  #
+  proc removeTestRun { value } {
+    regsub -all -- { TEST-RUN [0-9A-F]+(\s+)} $value {\1} value
+    return $value
+  }
+
+  #
+  # NOTE: This procedure returns the (regexp) pattern used to determine if
+  #       a given log file is considered to be "complete", i.e. it finished
+  #       at least one "test run".  If more than one test run was completed,
+  #       that may or may not be considered good; however, this procedure
+  #       is not concerned with that case.
+  #
+  proc getOverallResultPattern {} {
+    return [appendArgs \
+        {^OVERALL RESULT: } \
+        {(NONE|SUCCESS|FAILURE|STOP-ON-FAILURE|STOP-ON-LEAK)} \
+        {(?: \(\d+% (?:>=|<) \d+%\))?$}]; # optional threshold
+  }
+
+  #
+  # NOTE: This procedure may append a string to the specified variable in
+  #       the context of the immediate caller.
+  #
+  proc maybeAppendTo { varName value } {
+    if {[string length $varName] > 0} then {
+      upvar 1 $varName local
+
+      if {[info exists local] && \
+          [string length $local] > 0} then {
+        append local " "
+      }
+
+      append local $value
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to determine if the specified log file
+  #       represents a complete test suite run.
+  #
+  proc isLogFileComplete { fileName varName } {
+    if {[string length $varName] > 0} then {
+      upvar 1 $varName stage
+    }
+
+    set subPattern(prefix) \
+        {^---- (?:success|failure) logging remote test results: }
+
+    set subPattern(suffix) {$}
+    set subPattern(ok) {(?:OK )?\d+}
+    set subPattern(error) {ERROR(?: \{[: 0-9A-Za-z]+\})?}
+
+    # set subPattern(failure) {FAILURE(?: \{[: 0-9A-Za-z]+\})?}
+    set subPattern(failure) {FAILURE}; # rare, no message (?)
+
+    set subPattern(result) [appendArgs \
+        {(?:} $subPattern(ok) {|} $subPattern(error) {|} \
+        $subPattern(failure) {)}]
+
+    set pattern(1) [getOverallResultPattern]
+
+    set pattern(2) [appendArgs \
+        $subPattern(prefix) $subPattern(result) \
+        $subPattern(suffix)]
+
+    set pattern(3) [appendArgs \
+        $subPattern(prefix) \\\{ $subPattern(result) \
+        \\\} {(?: } \\\{ $subPattern(result) \\\} {)+} \
+        $subPattern(suffix)]
+
+    set pattern(4) {^SKIPPED: (\d+)$}
+    set pattern(5) {^SKIPPED: ([^\d].*)$}
+
+    set data [string map [list \r\n \n] [readSharedFile $fileName]]
+
+    if {![regexp -line -skip 1 -- $pattern(1) $data result]} then {
+      maybeAppendTo stage missing-result
+      return false
+    }
+
+    if {$result ni [list SUCCESS FAILURE]} then {
+      if {$result in [list NONE STOP-ON-FAILURE STOP-ON-LEAK]} then {
+        maybeAppendTo stage bad-result
+      } else {
+        maybeAppendTo stage unexpected-result
+      }
+
+      return false
+    }
+
+    if {![regexp -line -- $pattern(2) $data] && \
+        ![regexp -line -- $pattern(3) $data]} then {
+      maybeAppendTo stage remote-logging
+      return false
+    }
+
+    if {[regexp -line -- $pattern(4) $data dummy skippedCount]} then {
+      maybeAppendTo stage [appendArgs "skipped " $skippedCount]
+    }
+
+    if {[regexp -line -- $pattern(5) $data dummy skippedNames]} then {
+      maybeAppendTo stage [appendArgs "skippedNames " $skippedNames]
+    }
+
+    return true
+  }
+
+  #
+  # NOTE: This procedure attempts to determine if the target process exited
+  #       successfully -OR- was otherwise terminated, i.e. by this tool.
+  #
+  proc isProcessSuccess {
+          fileName pid deadVarName statusVarName stageVarName
+          {milliseconds 60000} } {
+    if {[string length $deadVarName] > 0} then {
+      upvar 1 $deadVarName dead
+    }
+
+    if {[string length $statusVarName] > 0} then {
+      upvar 1 $statusVarName status
+    }
+
+    if {[string length $stageVarName] > 0} then {
+      upvar 1 $stageVarName stage
+    }
+
+    after $milliseconds; set result 0; # NOTE: Target process exit?
+
+    if {[info exists dead] && $dead} then {
+      incr result
+      lappend status [appendArgs "target process " $pid " was killed"]
+    } else {
+      lappend status [appendArgs "target process " $pid " not killed"]
+    }
+
+    if {[isLogFileComplete $fileName stage]} then {
+      lappend status [appendArgs "log file \"" $fileName "\" complete"]
+    } else {
+      incr result
+      lappend status [appendArgs "log file \"" $fileName "\" incomplete"]
+    }
+
+    if {[isProcessRunning $pid]} then {
+      lappend status [appendArgs "target process " $pid " is running"]
+    } else {
+      incr result
+      lappend status [appendArgs "target process " $pid " is dead"]
+    }
+
+    return [expr {$result == 0}]
+  }
+
+  #
+  # NOTE: This procedure attempts to emit a trace message -AND- log that
+  #       same message to the configured remote server.
+  #
+  proc logWatchMessage { message } {
+    traceMessage $message
+
+    if {[info exists ::no(directLogRemoteMessage)]} then {
+      logRemoteMessageWrapper $message
+    } else {
+      logRemoteMessage $message
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to locally log the fact that an event
+  #       of some kind that took place and lasted for a time.
+  #
+  proc logElapsedLocalEvent {
+          event fileName stage varName {message ""} } {
+    if {![info exists ::no(logElapsedLocalEvent)]} then {
+      if {[string length $varName] > 0} then {
+        upvar 1 $varName changed
+      }
+
+      set logStatus [getLogFileStatus $fileName]
+
+      if {[info exists changed(elapsed)]} then {
+        set elapsed $changed(elapsed)
+      } else {
+        set elapsed <unknown>
+      }
+
+      catch {
+        #
+        # NOTE: Since our test log file is the same as the
+        #       target process, this will emit the message
+        #       there, which is exactly what we want.
+        #
+        set formatted [appendArgs \
+            "==== \"" $fileName "\" " $event "_LOG_FILE stage " \
+            $stage " elapsed " $elapsed " commandLine " \
+            [getDictionaryValue $logStatus CMD-LINE]]
+
+        if {[string length $message] > 0} then {
+          append formatted " message \{" $message \}
+        }
+
+        append formatted \n
+        tlog $formatted
+      }
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to locally log the fact that an event
+  #       of some kind that took place.
+  #
+  proc logLocalEvent {
+          event fileName last alive status stage {message ""} } {
+    if {![info exists ::no(logLocalEvent)]} then {
+      set logStatus [getLogFileStatus $fileName]
+
+      if {[string length $status] == 0} then {
+        set status <none>
+      }
+
+      catch {
+        #
+        # NOTE: Since our test log file is the same as the
+        #       target process, this will emit the message
+        #       there, which is exactly what we want.
+        #
+        set formatted [appendArgs \
+            "==== \"" $fileName "\" " $event "_LOG_FILE with " \
+            $logStatus " last " $last " alive " $alive " status " \
+            $status " stage " $stage]
+
+        if {[string length $message] > 0} then {
+          append formatted " message \{" $message \}
+        }
+
+        append formatted \n
+        tlog $formatted
+      }
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to remotely log the fact that an event
+  #       of some kind that took place and lasted for a time.
+  #
+  proc logElapsedRemoteEvent {
+          event fileName stage varName {message ""} } {
+    if {![info exists ::no(logElapsedRemoteEvent)]} then {
+      if {[string length $varName] > 0} then {
+        upvar 1 $varName changed
+      }
+
+      set logStatus [getLogFileStatus $fileName]
+
+      if {[info exists changed(elapsed)]} then {
+        set elapsed $changed(elapsed)
+      } else {
+        set elapsed <unknown>
+      }
+
+      catch {
+        #
+        # NOTE: Attempt to remotely log the target test run
+        #       as a failure.  This may fail if the API key
+        #       is missing, etc.  In that case, ignore any
+        #       failures.
+        #
+        set formatted [appendArgs \
+            "MONITOR " $event " TEST-RUN " [getDictionaryValue \
+            $logStatus TEST-RUN] ": host " $::tcl_platform(host) \
+            " log " $fileName " stage " $stage " elapsed " $elapsed \
+            " commandLine " [getDictionaryValue $logStatus CMD-LINE]]
+
+        if {[string length $message] > 0} then {
+          append formatted " message " $message
+        }
+
+        logWatchMessage $formatted
+      }
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to remotely log the fact that an event
+  #       of some kind that took place.
+  #
+  proc logRemoteEvent {
+          event fileName last alive status stage {message ""} } {
+    if {![info exists ::no(logRemoteEvent)]} then {
+      set logStatus [getLogFileStatus $fileName]
+
+      set now [clock seconds]
+      set mtime [getDictionaryValue $logStatus mtime]
+
+      if {[string is integer -strict $mtime]} then {
+        set elapsed [expr {$now - $mtime}]
+      } else {
+        set elapsed <unknown>; # error?
+      }
+
+      if {[string length $status] == 0} then {
+        set status <none>
+      }
+
+      catch {
+        #
+        # NOTE: Attempt to remotely log the status of the
+        #       target test run.  This may fail if the API
+        #       key is missing, etc.  In that case, ignore
+        #       any failures.
+        #
+        set formatted [appendArgs \
+            "MONITOR " $event " TEST-RUN " [getDictionaryValue \
+            $logStatus TEST-RUN] ": host " $::tcl_platform(host) \
+            " log " $fileName " with " [removeTestRun $logStatus] \
+            " last " $last " alive " $alive " elapsed " $elapsed \
+            " status " $status " stage " $stage]
+
+        if {[string length $message] > 0} then {
+          append formatted " message " $message
+        }
+
+        logWatchMessage $formatted
+      }
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to log the fact that a PING event took
+  #       place.
+  #
+  proc logPing { fileName last alive status stage } {
+    #
+    # BUGBUG: Actually, this procedure cannot log anything
+    #         locally.  If it did, it would prevent "hung"
+    #         detection from working (i.e. it would update
+    #         the local log file modification time).
+    #
+    if {![info exists ::no(logRemotePing)]} then {
+      logRemoteEvent PING $fileName $last $alive $status $stage
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to log the fact that a DONE event took
+  #       place.
+  #
+  proc logDone { fileName last alive status stage } {
+    if {![info exists ::no(tlogDone)]} then {
+      logLocalEvent DONE $fileName $last $alive $status $stage
+    }
+
+    if {![info exists ::no(logRemoteDone)]} then {
+      logRemoteEvent DONE $fileName $last $alive $status $stage
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to log the fact that a CRASH event took
+  #       place.
+  #
+  proc logCrash { fileName last alive status stage } {
+    if {![info exists ::no(tlogCrash)]} then {
+      logLocalEvent CRASH $fileName $last $alive $status $stage
+    }
+
+    if {![info exists ::no(logRemoteCrash)]} then {
+      logRemoteEvent CRASH $fileName $last $alive $status $stage
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to log the fact that a KILL event took
+  #       place.
+  #
+  proc logKillProcess { fileName stage varName } {
+    if {[string length $varName] > 0} then {
+      upvar 1 $varName changed
+    }
+
+    if {![info exists ::no(tlogKillProcess)]} then {
+      logElapsedLocalEvent KILL $fileName $stage changed
+      shouldCountAsLogged changed 1
+    }
+
+    if {![info exists ::no(logRemoteKillProcess)]} then {
+      logElapsedRemoteEvent KILL $fileName $stage changed
+      shouldCountAsLogged changed 1
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to log the fact that a HUNG event took
+  #       place.
+  #
+  proc logHungProcess { fileName stage varName } {
+    if {[string length $varName] > 0} then {
+      upvar 1 $varName changed
+    }
+
+    if {![info exists ::no(tlogHungProcess)]} then {
+      logElapsedLocalEvent HUNG $fileName $stage changed
+      shouldCountAsLogged changed 1
+    }
+
+    if {![info exists ::no(logRemoteHungProcess)]} then {
+      logElapsedRemoteEvent HUNG $fileName $stage changed
+      shouldCountAsLogged changed 1
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to kill the specified process -OR- its
+  #       entire process group.
+  #
+  proc killProcess { pid varName {force true} {group false} } {
+    #
+    # HACK: Allow external code to forbid the killing of a
+    #       process, both via setting a global array element
+    #       value in this interpreter -OR- writing an empty
+    #       file named using the test log -OR- script paths
+    #       and a ".noKillProcess" tag suffix.
+    #
+    if {![info exists ::no(killProcess)] && \
+        ![checkForTaggedPath noKillProcess]} then {
+      if {!$force && ![isProcessRunning $pid]} then {
+        error [appendArgs "target process " $pid " is already dead"]
+      }
+
+      if {[catch {
+        #
+        # NOTE: At this point, terminate the target process
+        #       with extreme force.
+        #
+        if {[string length $varName] > 0} then {
+          upvar 1 $varName dead
+        }
+
+        if {[isWindows]} then {
+          #
+          # NOTE: This should be rare on Windows, as Eagle
+          #       shell processes are not generally known
+          #       to hang there.  Just use the [kill] core
+          #       command to kill the target process.  For
+          #       some reason, maybe this is not effective
+          #       for Linux when running the Mono runtime?
+          #
+          kill -force -- $pid
+        } else {
+          #
+          # HACK: Kill the entire process group?  This is
+          #       an extreme measure.  The process groups
+          #       should be setup by the (Bash?) scripts
+          #       that execute the test suite.  This may
+          #       cause this script to kill this process
+          #       as well.  By default, this behavior is
+          #       only used when this script detects the
+          #       target process appears to be hung.
+          #
+          # NOTE: This was originally created to address
+          #       hangs in the Demo plugin test suite.
+          #       Sometimes, one or more of the nested
+          #       shells used by its test suite will not
+          #       exit cleanly and those processes are
+          #       not directly "known" to this script;
+          #       therefore, every process grouped with
+          #       the target process must be killed.
+          #
+          if {!$group || [llength [info \
+              commands maybeKillProcessGroup]] == 0 ||
+              ![maybeKillProcessGroup $pid true]} then {
+            #
+            # NOTE: Ok, kill the target process only.
+            #       This seems reasonable since it is
+            #       (likely) hung due to Mono runtime
+            #       bugs, etc.
+            #
+            exec -success Success -- kill -s KILL $pid
+          }
+        }
+
+        set dead true
+      }] == 0} then {
+        return true
+      }
+    }
+
+    return false
+  }
+
+  #
+  # NOTE: This procedure attempts to kill the specified process -AND- the
+  #       current process.
+  #
+  proc killProcessAndSelf { pid varName {force true} {group false} } {
+    #
+    # NOTE: This procedure is an experimental attempt to
+    #       kill the target process and this process as a
+    #       means of being tidy in the event of hangs.
+    #
+    if {![info exists ::no(killProcessAndSelf)] && \
+        ![checkForTaggedPath noKillProcessAndSelf]} then {
+      if {[string length $varName] > 0} then {
+        upvar 1 $varName dead
+      }
+
+      killProcess $pid dead $force $group; # NOTE: Kill target process.
+      killProcess [pid] "" $force $group;  # NOTE: Kill this process.
+
+      error "why am I still alive?"
+    }
+  }
+
+  #
+  # NOTE: This procedure attempts to kill the specified process, which is
+  #       now regarded as being hopelessly hung.
+  #
+  proc killHungProcess { fileName pid varName stage {force true} } {
+    #
+    # NOTE: The specified (log) file has not been changed
+    #       in a very long time; assume target process is
+    #       hung, log this in the specified (log) file as
+    #       well as remotely, and then forcibly kill it.
+    #       Skip this handling if explicitly forbidden by
+    #       external code.
+    #
+    # HACK: Allow external code to forbid the killing of a
+    #       hung process, both via setting a global array
+    #       element value in this interpreter -OR- writing
+    #       an empty file named using this script path and
+    #       a ".hung" suffix.
+    #
+    if {![info exists ::no(killHungProcess)] && \
+        ![checkForTaggedPath noKillHungProcess]} then {
+      if {[string length $varName] > 0} then {
+        upvar 1 $varName dead
+      }
+
+      return [killProcess $pid dead $force true]
+    }
+
+    return false
+  }
+
+  #
+  # NOTE: Provide the "watchCat" library package to the interpreter.
+  #
+  package provide WatchCat.Library \
+    [expr {[isEagle] ? [info engine PatchLevel] : "1.0"}]
+}
+

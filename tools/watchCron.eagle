@@ -1,0 +1,96 @@
+###############################################################################
+#
+# watchCron.eagle --
+#
+# Extensible Adaptable Generalized Logic Engine (Eagle)
+# Cron Job Watcher ... "In the end, there can be only one!"
+#
+# Copyright (c) 2007-2012 by Joe Mistachkin.  All rights reserved.
+#
+# See the file "license.terms" for information on usage and redistribution of
+# this file, and for a DISCLAIMER OF ALL WARRANTIES.
+#
+# RCS: @(#) $Id: $
+#
+###############################################################################
+
+#
+# NOTE: Use our own namespace here because even though we do not directly
+#       support namespaces ourselves, we do not want to pollute the global
+#       namespace if this script actually ends up being evaluated in Tcl.
+#
+namespace eval ::Eagle {
+  if {[llength $argv] != 1} then {
+    error [appendArgs "usage: " \
+        [file tail [getShellExecutableName]] " " \
+        [file tail [info script]] " <fileName>"]
+  }
+
+  set fileName [lindex $argv 0]
+
+  if {![file exists $fileName] || ![file isfile $fileName]} then {
+    error "bad file name: must point to an existing regular file"
+  }
+
+  set path [file dirname [info script]]
+
+  if {[info exists env(XDG_WATCHCAT_HOME)]} then {
+    lappend auto_path $env(XDG_WATCHCAT_HOME)
+  } elseif {[info exists env(XDG_STARTUP_HOME)]} then {
+    lappend auto_path [file join \
+        $env(XDG_STARTUP_HOME) LoadOnStartup Public WatchCat]
+  } else {
+    lappend auto_path $path
+  }
+
+  package require Eagle.Test
+  package require WatchCat.Library
+
+  set data [readSharedFile $fileName]
+  set data [string map [list \r\n \n] $data]
+
+  set pattern(1) [getOverallResultPattern]
+  set pattern(2) {^---- testRunId: ([0-9A-F]{64})$}
+  set pattern(3) {"[^"]+ BATCH-ID ([0-9A-F]{64})(?:"|\})}
+
+  set knownResults [list \
+      NONE SUCCESS FAILURE STOP-ON-FAILURE STOP-ON-LEAK]
+
+  foreach knownResult $knownResults {
+    set counts($knownResult) 0
+  }
+
+  set counts(TOTAL) 0
+  set counts(UNKNOWN) 0
+
+  foreach result [regexp \
+      -all -line -inline -skip 1 -- $pattern(1) $data] {
+    if {$result in $knownResults} then {
+      incr counts($result)
+    } else {
+      incr counts(UNKNOWN)
+    }
+
+    incr counts(TOTAL)
+  }
+
+  set testRunIds [list]
+
+  foreach testRunId [regexp \
+      -all -line -inline -skip 1 -- $pattern(2) $data] {
+    lappend testRunIds $testRunId
+  }
+
+  set testRunIds [lsort -unique $testRunIds]
+  set counts(RUNS) [llength $testRunIds]
+
+  if {[info exists ::env(BATCH_ID)]} then {
+    set bid $::env(BATCH_ID)
+  } elseif {![regexp -skip 1 -- $pattern(3) $data bid]} then {
+    set bid unknown
+  }
+
+  logRemoteMessage [appendArgs \
+      "BATCH BATCH-ID " $bid " TOTALS TEST-RUN: host " \
+      $tcl_platform(host) " counts " [testArrayGet counts]]
+}

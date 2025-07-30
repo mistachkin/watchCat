@@ -1,0 +1,376 @@
+###############################################################################
+#
+# watchCat.tool.eagle --
+#
+# Extensible Adaptable Generalized Logic Engine (Eagle)
+# Log File Monitoring Tool
+#
+# Copyright (c) 2007-2012 by Joe Mistachkin.  All rights reserved.
+#
+# See the file "license.terms" for information on usage and redistribution of
+# this file, and for a DISCLAIMER OF ALL WARRANTIES.
+#
+# RCS: @(#) $Id: $
+#
+###############################################################################
+
+#
+# NOTE: Use our own namespace here because even though we do not directly
+#       support namespaces ourselves, we do not want to pollute the global
+#       namespace if this script actually ends up being evaluated in Tcl.
+#
+namespace eval ::Eagle {
+  #
+  # NOTE: First, load our associated script library package.
+  #
+  set path [file dirname [info script]]
+
+  if {[info exists ::env(XDG_WATCHCAT_HOME)]} then {
+    lappend auto_path $::env(XDG_WATCHCAT_HOME)
+  } elseif {[info exists ::env(XDG_STARTUP_HOME)]} then {
+    lappend auto_path [file join \
+        $::env(XDG_STARTUP_HOME) LoadOnStartup Public WatchCat]
+  } else {
+    lappend auto_path $path
+  }
+
+  package require WatchCat.Library
+
+  #############################################################################
+
+  #
+  # NOTE: Setup the global cleanup handler to be called whenever this
+  #       tool is exiting.
+  #
+  set cleanup true; hookForCleanup true
+
+  #############################################################################
+
+  #
+  # NOTE: Attempt to validate the command line arguments here.  The
+  #       first argument must be an existing (log) file.  The second
+  #       argument must be a (running) process identifier.
+  #
+  if {[llength $argv] != 2} then {
+    error [appendArgs "usage: " \
+        [file tail [getShellExecutableName]] " " \
+        [file tail [info script]] " <fileName> <pid>"]
+  }
+
+  set fileName [lindex $argv 0]
+
+  if {![file exists $fileName] || ![file isfile $fileName]} then {
+    error "bad file name: must point to an existing regular file"
+  }
+
+  if {![info exists ::test_channel]} then {
+    set ::test_channel stdout
+  }
+
+  set pid [lindex $argv 1]
+
+  if {[string is not integer -strict $pid]} then {
+    error "bad process identifier: must be an integer"
+  }
+
+  #############################################################################
+
+  #
+  # HACK: Loudly announce that we are actually doing something
+  #       important that may impact the external test process,
+  #       i.e. it may be killed if "hung"...
+  #
+  catch {
+    traceMessage [appendArgs \
+        "WATCH-CAT IS NOW MONITORING test process " $pid \
+        " from external log monitor process " [pid] ...]
+  }
+
+  #############################################################################
+
+  #
+  # NOTE: Set the default "consider process as hung" duration to be
+  #       one hour; however, allow it to be overridden externally.
+  #
+  if {![info exists limit]} then {; # seconds
+    if {$tcl_platform(host) in [list LACHRYMOSE DESKTOP-N5Q9D24]} then {
+      #
+      # HACK: This is the "overnight" limit, which is to allow tests
+      #       to be run while I am sleeping.  It is not the time the
+      #       test should ideally take.  Yeah, it is a slow test.
+      #
+      set limit [expr {60 * 60 * 8}]; # 8 hours (see test "exec-2.1")
+    } else {
+      set limit [expr {60 * 60 * 1}]; # 1 hour (see test "exec-2.1")
+    }
+  }
+
+  #
+  # NOTE: Set the default "log ping to remote server" duration to be
+  #       ten minutes; however, allow it to be overridden externally.
+  #
+  if {![info exists ping]} then {; # seconds
+    set ping [expr {60 * 20}]; # 20 minutes
+  }
+
+  #
+  # NOTE: Set the default "aggressive" to disabled.  This means there
+  #       may be survivors from this tool.
+  #
+  if {![info exists aggressive]} then {
+    set aggressive false
+  }
+
+  #
+  # NOTE: Set the default "verbose" to disabled.  This means detailed
+  #       tracing will not be enabled for this tool.
+  #
+  if {![info exists verbose]} then {
+    set verbose false
+  }
+
+  #
+  # NOTE: Set the default "quiet mode" to enabled.  This means there
+  #       will be no non-error output from this tool.
+  #
+  if {![info exists quiet]} then {
+    set quiet true
+  }
+
+  #############################################################################
+
+  #
+  # NOTE: Since this script (almost always) requires the [tlog] and
+  #       [logRemoteMessage] procedures to be useful, we attempt to
+  #       require the test package now.  Also, this script requires
+  #       the [isActiveProcess] procedure when running on Windows,
+  #       which is contained in the test package.
+  #
+  package require Eagle.Test
+  set ::test_log $fileName; # HACK: It's my log file now too.
+
+  if {![info exists ::test_run_id]} then {
+    set ::test_run_id [getDictionaryValue \
+        [getTestRunDataFromLogFile $fileName] TEST-RUN]
+  }
+
+  if {[llength [info commands setupTestRunTag]] > 0} then {
+    setupTestRunTag stdout true; # quiet
+  }
+
+  if {$verbose && \
+      [llength [info commands enableTracing]] > 0} then {
+    enableTracing
+  }
+
+  #############################################################################
+
+  #
+  # NOTE: Override default number of web request retries to be
+  #       three -OR- the number provided by our caller.
+  #
+  catch {; # COMPAT: Beta 54.
+    object invoke Utility SetWebMaximumRetries \
+        [expr {[info exists retries] ? $retries : 3}]
+  }
+
+  #############################################################################
+
+  #
+  # NOTE: Attempt to determine if the external "kill" tool (e.g.
+  #       provided by the operating system) works by using it on
+  #       ourselves.  We know that we are alive; therefore, if
+  #       the tool is missing -OR- returns false, it is broken.
+  #
+  if {![isProcessRunning [pid]]} then {
+    error "unsupported platform: external \"kill\" tool unavailable"
+  }
+
+  #############################################################################
+
+  catchAndMaybeLog $fileName outer changed {
+    set last 0; set alive 0; set dead false; set status [list]
+
+    while {[isProcessRunning $pid]} {
+      #
+      # NOTE: Ok, the target process has now been seen alive.
+      #
+      incr alive
+
+      #
+      # NOTE: If a tagged path is present that indicates we
+      #       should kill the current process, do it now.
+      #
+      if {[checkForTaggedPath killProcess] || \
+          [checkForTaggedPath [appendArgs killProcess $pid]]} then {
+        logKillProcess $fileName tagged changed
+        killProcess $pid dead tagged
+        break; # STOP WAITING
+      }
+
+      #
+      # NOTE: Has the specified (log) file been changed since
+      #       it was last checked?  Figure out if the elapsed
+      #       time since then exceeds the number of seconds
+      #       used to determine if the target process should
+      #       be considered hung.
+      #
+      if {![hasFileChanged $fileName changed] && !$dead && \
+          [isProcessHung $limit $fileName changed $quiet]} then {
+        #
+        # NOTE: The specified (log) file has not been changed
+        #       in a very long time; assume target process is
+        #       hung, log this in the specified (log) file as
+        #       well as remotely, and then forcibly kill it.
+        #
+        set stage main; isLogFileComplete $fileName stage
+        logHungProcess $fileName $stage changed
+        killHungProcess $fileName $pid dead $stage
+        break; # STOP WAITING
+      }
+
+      #
+      # NOTE: Is the remote server ping interval configured
+      #       and enabled?
+      #
+      if {$ping > 0} then {
+        #
+        # NOTE: Time to ping the remote server (i.e. with a
+        #       new log entry)?  The first time through the
+        #       loop, this is always done.
+        #
+        if {$last == 0 || \
+            [clock seconds] - $last >= $ping} then {
+          logPing $fileName $last $alive $status main
+          set last [clock seconds]
+        }
+      }
+
+      #
+      # NOTE: Wait for at least 10 seconds here.  There is no
+      #       need to spin-up the CPU.
+      #
+      after [expr {int(min(10000, $limit * 1000.0 / 100.0))}]
+    }
+
+    ###########################################################################
+
+    if {$alive > 0} then {
+      #
+      # NOTE: Verify the specified (log) file appears to be
+      #       complete.  This means it must contain at least
+      #       the following information:
+      #
+      #       1. An "OVERALL RESULT: " line that indicates
+      #          "SUCCESS", "FAILURE", etc.  Other values
+      #          are unexpected here and should be treated
+      #          as a serious issue.
+      #
+      #       2. A line confirming test results were logged
+      #          successfully to the remote server.
+      #
+      #       If either of the above conditions do not hold,
+      #       attempt to log an error to the remote server.
+      #
+      if {!$dead && ![isLogFileComplete $fileName stage]} then {
+        logHungProcess $fileName $stage changed
+        killHungProcess $fileName $pid dead $stage
+      }
+    } else {
+      #
+      # NOTE: If target process was never seen as alive,
+      #       raise an error.
+      #
+      error [appendArgs "process " $pid " was not running"]
+    }
+
+    ###########################################################################
+
+    #
+    # NOTE: This is not a copy/paste error.  Check the log
+    #       file again to see if the target process should
+    #       be considered as hung, even if it is now dead.
+    #
+    if {![hasFileChanged $fileName changed] && !$dead && \
+        [isProcessHung $limit $fileName changed $quiet]} then {
+      #
+      # NOTE: The specified (log) file has not been changed
+      #       in a very long time; assume target process is
+      #       hung, log this in the specified (log) file as
+      #       well as remotely, and then forcibly kill it.
+      #
+      set stage exit; isLogFileComplete $fileName stage
+      logHungProcess $fileName $stage changed
+      killHungProcess $fileName $pid dead $stage
+    }
+
+    ###########################################################################
+
+    #
+    # NOTE: If everything was "successful" and the (target) process is
+    #       (somehow) still running and it should not be, kill it.  This
+    #       is being done because Mono on Linux sometimes (?) likes to
+    #       hang during exit after the test runs.
+    #
+    if {[isProcessSuccess $fileName $pid dead status stage]} then {
+      killHungProcess $fileName $pid dead complete
+    }
+
+    ###########################################################################
+
+    #
+    # NOTE: If "aggressive" mode is enabled, make sure target process is
+    #       dead by attempting to kill it again.
+    #
+    if {$aggressive} then {
+      killHungProcess $fileName $pid dead aggressive
+    }
+
+    ###########################################################################
+
+    #
+    # BUGFIX: At this point, if there is no stage information, set it to
+    #         represent that this tool run (and its associated test run)
+    #         is now considered "complete".
+    #
+    if {![info exists stage]} then {
+      set stage done
+    }
+
+    ###########################################################################
+
+    #
+    # NOTE: Finally, add local and remote log entries showing when we're
+    #       actually preparing to exit this tool.
+    #
+    if {[isLogFileComplete $fileName stage]} then {
+      #
+      # NOTE: The log file appears to be complete.  This means the tests
+      #       completed (successfully?) and full summary information was
+      #       successfully sent to the remote logging server.
+      #
+      logDone $fileName $last $alive $status $stage
+    } elseif {![shouldCountAsLogged changed]} then {
+      #
+      # BUGFIX: If we get here, the log file appears to be incomplete
+      #         -AND- there was not already a "final" log file status,
+      #         e.g. KILL, HUNG, etc.  For this case, it is likely the
+      #         target process has crashed.
+      #
+      logCrash $fileName $last $alive $status $stage
+    } else {
+      #
+      # BUGFIX: Log nothing.  The log file appears to be incomplete;
+      #         however, there is already a "final" log file status,
+      #         e.g. KILL, HUNG, etc.
+      #
+    }
+
+    #
+    # NOTE: At this point, we are done.  Set the cleanup variable to
+    #       prevent the "PreInterpreterDisposed" callback from doing
+    #       any superfluous reporting, etc.
+    #
+    set cleanup false
+  }
+}

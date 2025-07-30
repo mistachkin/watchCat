@@ -1,0 +1,40 @@
+###############################################################################
+#
+# pkgIndex_73136ca5b5704bd4.eagle --
+#
+# Extensible Adaptable Generalized Logic Engine (Eagle)
+# Package Index File
+#
+# Copyright (c) 2007-2012 by Joe Mistachkin.  All rights reserved.
+#
+# See the file "license.terms" for information on usage and redistribution of
+# this file, and for a DISCLAIMER OF ALL WARRANTIES.
+#
+# RCS: @(#) $Id: $
+#
+###############################################################################
+
+if {![package vsatisfies [package provide Tcl] 8.4]} {return}
+if {![package vsatisfies [package provide Eagle] 1.0]} {return}
+
+###############################################################################
+
+package ifneeded Eagle.WatchCat 1.0 \
+    [list source -library true -- [file join $dir watchCat.eagle]]
+
+###############################################################################
+
+apply [list [list dir tag] {
+  set patchLevel 1.0.9001.43210
+  set fileName [file join $dir watchCat.library.eagle]
+  set command [list sourceWithInfo]
+
+  if {[info exists ::eagle_platform(patchLevel)] && \
+      [package vcompare $::eagle_platform(patchLevel) \
+      $patchLevel] > 0} then {
+    lappend command -library true
+  }
+
+  lappend command -- $fileName
+  package ifneeded WatchCat.Library 1.0 $command
+}] $dir $tag
