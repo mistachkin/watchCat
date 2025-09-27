@@ -139,12 +139,6 @@ lappend auto_path [file normalize [file join $here .. packages]]
 source [file join $here watchCat.tool.eagle]
 ```
 
-Run it like:
-
-```bash
-eagle path/to/watchCat.wrap.eagle "out/test.log" $TEST_PID
-```
-
 ---
 
 ## Safety “tags” (control via files)
