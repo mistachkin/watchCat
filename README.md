@@ -30,7 +30,7 @@ Automatically detects hangs, logs progress locally and remotely, and (when neede
 watchCat/
 ├─ packages/
 │  ├─ pkgIndex_*.eagle            # Declares Eagle.WatchCat & WatchCat.Library
-│  ├─ watchCat.eagle              # Eagle Integration Procedures (wiring, hooks)
+│  ├─ watchCat.eagle              # Test Package Integration Procedures (wiring, hooks)
 │  └─ watchCat.library.eagle      # Tool Library Procedures (internal API)
 └─ tools/
    ├─ watchCat.tool.eagle         # Primary CLI tool: watch one log + PID
@@ -278,7 +278,7 @@ Authored by **Joe Mistachkin** (Mistachkin Systems), also the author of **Eagle*
 **watchCat**
 
 ```text
-eagle tools/watchCat.tool.eagle <fileName> <pid>
+dotnet exec EagleShell.dll -file tools/watchCat.tool.eagle <fileName> <pid>
 ```
 
 * Validates `<fileName>` exists and `<pid>` is an integer.
@@ -286,7 +286,7 @@ eagle tools/watchCat.tool.eagle <fileName> <pid>
 **watchCron**
 
 ```text
-eagle tools/watchCron.eagle <fileName>
+dotnet exec EagleShell.dll -file tools/watchCron.eagle <fileName>
 ```
 
 * Validates `<fileName>` exists; aggregates results; logs one “BATCH TOTALS” record using `env(BATCH_ID)` or a parsed value.
