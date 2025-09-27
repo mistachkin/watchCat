@@ -9,7 +9,7 @@ Automatically detects hangs, logs progress locally and remotely, and (when neede
 >
 >   * `packages/watchCat.eagle` — library of integration helpers (`Eagle.Test` procedure hooks, automatic `watchCat.tool.eagle` execution, etc).
 >   * `packages/watchCat.library.eagle` — library of tool helpers (file change detection, “is log complete?” checks, kill helpers, remote/local logging, etc).
->   * `tools/watchCat.tool.eagle` — the log monitor you run **beside** your test process. It watches a single log file and a target PID; if the log stops changing too long, it declares the run hung and kills the process. It can also periodically “ping” your remote server via Eagle’s test logging.
+>   * `tools/watchCat.tool.eagle` — the log monitor you run **beside** your test process. It watches a single log file and a target process; if the log stops changing too long, it declares the run hung and kills the process. It can also periodically “ping” your remote server via Eagle’s test logging.
 >   * `tools/watchCron.eagle` — a simple post‑run/cron summarizer: counts `OVERALL RESULT` lines in a log, finds unique test‑run IDs, and sends a single “TOTALS” record to your remote logger.
 > * Ship as Eagle packages: **`Eagle.WatchCat 1.0`** and **`WatchCat.Library 1.0`** (pkgIndex provided).
 
@@ -33,7 +33,7 @@ watchCat/
 │  ├─ watchCat.eagle              # Test Package Integration Procedures (wiring, hooks)
 │  └─ watchCat.library.eagle      # Tool Library Procedures (internal API)
 └─ tools/
-   ├─ watchCat.tool.eagle         # Primary CLI tool: watch one log + PID
+   ├─ watchCat.tool.eagle         # Primary CLI tool: watch one log + process
    └─ watchCron.eagle             # Secondary CLI tool: cron batch roll-up
 ```
 
@@ -78,9 +78,9 @@ lappend auto_path [file join $::env(PROJECT_ROOT) externals watchCat packages]
 
 ## Quick start
 
-### 1) Start your test run and capture the PID
+### 1) Load integration package and start your test run
 
-**Projects using Eagle test-suite infrastructure:**
+**Projects using Eagle the test-suite infrastructure:**
 
 ```tcl
 # The test-suites that need WatchCat should do the following (at some point):
@@ -93,13 +93,15 @@ lappend ::auto_path $::env(SCRATCH_ROOT)
 package require Eagle.WatchCat
 hookGetTestLogForWatchCat true true
 
-# After this, just run the test-suite as usual, e.g. via "all.eagle".
+###############################################################################
+# After this, just [source] your test-suite as usual, e.g. via "all.eagle".
+###############################################################################
 ```
 
 Under the hood watchCat will:
 
-* `package require WatchCat.Library` and `Eagle.Test` (so it can write to your test log and talk to your remote logger).
-* Treat the first arg as the **log file** and the second as the **target PID** (both validated).
+* Run `watchCat.tool.eagle` automatically, as necessary, i.e. so it can write to your test log and talk to your remote logger.
+* Treat the first arg as the **log file name** and the second as the **target PID** (both validated).
 * Loop forever while the process is alive:
 
   * If a **tagged “kill” file** appears (`<log>.killProcess` or `<log>.killProcess<PID>`), it will log the event and kill the process immediately.
