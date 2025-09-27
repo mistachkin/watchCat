@@ -202,19 +202,13 @@ watchCat assumes the standard Eagle test harness:
 
 ---
 
-## Examples
+## Killing hung tests
 
-### (POSIX) Kill hung test groups
+### POSIX
 
 If your test launcher puts the run in its own **process group**, watchCat’s POSIX path can kill the **entire group** on a HUNG (uses `kill -s KILL` or a harness‑provided `maybeKillProcessGroup`).
 
-```bash
-# In your launcher, create a process group first, then record the shell PID
-# ...
-eagle tools/watchCat.tool.eagle "$LOG" $TEST_PID &
-```
-
-### (Windows) Normal kill path
+### Windows
 
 On Windows, liveness is checked via `isActiveProcess`, and watchCat uses Eagle’s `kill -force` command when it must terminate.
 
@@ -239,33 +233,15 @@ On Windows, liveness is checked via `isActiveProcess`, and watchCat uses Eagle�
 
 ---
 
-## Public API (library highlights)
-
-You most likely won’t call these directly, but for completeness:
-
-* `hasFileChanged file ?varName?` — track mtime per file.
-* `isProcessHung limit file ?varName? ?quiet?` — stale‐log detector.
-* `isLogFileComplete file ?stageVar?` — log completeness heuristic (regexes).
-* `killProcess pid ?deadVar? ?force? ?group?` and `killHungProcess file pid ?deadVar? stage` — termination helpers.
-* `logPing|logDone|logCrash|logKillProcess|logHungProcess` — local + remote logging shims around your Eagle.Test integration.
-
----
-
 ## Contributing
 
-* The repository is brand new (initial import + minor follow‑up commit for syntax highlighting). PRs welcome for docs, new heuristics, and portability improvements.
+* The repository is brand new. PRs welcome for docs, new heuristics, and portability improvements.
 
 ---
 
 ## License
 
-Each source file contains a standard header referencing `license.terms`. If that file is not present in your checkout, consult the author’s licensing terms as indicated in the headers.
-
----
-
-## Acknowledgements
-
-Authored by **Joe Mistachkin** (Mistachkin Systems), also the author of **Eagle**.
+This project is available under the **BSD 3‑Clause** license. See [LICENSE](./LICENSE).
 
 ---
 
