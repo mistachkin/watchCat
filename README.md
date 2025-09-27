@@ -101,10 +101,10 @@ hookGetTestLogForWatchCat true true
 Under the hood watchCat will:
 
 * Run `watchCat.tool.eagle` automatically, as necessary, i.e. so it can write to your test log and talk to your remote logger.
-* Treat the first arg as the **log file name** and the second as the **target PID** (both validated).
+* Treat the first arg as the **log file name** and the second as the **target process identifier** (both validated).
 * Loop forever while the process is alive:
 
-  * If a **tagged “kill” file** appears (`<log>.killProcess` or `<log>.killProcess<PID>`), it will log the event and kill the process immediately.
+  * If a **tagged “kill” file** appears (`<log>.killProcess` or `<log>.killProcess<pid>`), it will log the event and kill the process immediately.
   * If the log **hasn’t changed** and the **elapsed time** exceeds `limit`, it logs “HUNG” locally & remotely and kills the process (optionally the whole process group on POSIX).
   * If `ping > 0`, it periodically **PINGs** your remote logger with elapsed status.
 * On exit, it verifies the log “looks complete” (i.e., contains a valid `OVERALL RESULT` and a successful remote logging line) and logs **DONE** or **CRASH** accordingly.
@@ -147,13 +147,13 @@ source [file join $here watchCat.tool.eagle]
 
 watchCat checks for special files next to your log (or script) to alter behavior at runtime. Create an **empty file** with the appropriate suffix to trigger:
 
-| Tag file                        | Effect                                                                    |
-| ------------------------------- | ------------------------------------------------------------------------- |
-| `<log>.killProcess`             | Kill the watched process now (logs event first).            |
-| `<log>.killProcess<PID>`        | Same, but only for a matching PID (useful if PIDs recycle). |
-| `<log>.noKillProcess`           | Disable **all** kill attempts (safety interlock).           |
-| `<script>.noKillHungProcess`    | Disable “hung” kill path (diagnostics).                     |
-| `<script>.noKillProcessAndSelf` | Disable the rare “kill both target and self” path.          |
+| Tag file                             | Effect                                                                    |
+| ------------------------------------ | ------------------------------------------------------------------------- |
+| `<logOrScript>.killProcess`          | Kill the watched process now (logs event first).                          |
+| `<logOrScript>.killProcess<pid>`     | Same, but only for a matching process identifier.                         |
+| `<logOrScript>.noKillProcess`        | Disable **all** kill attempts (safety interlock).                         |
+| `<logOrScript>.noKillHungProcess`    | Disable “hung” kill path (diagnostics).                                   |
+| `<logOrScript>.noKillProcessAndSelf` | Disable the experimental “kill both target and self” path (not used).     |
 
 > These files are checked with a simple `file exists` + tag regex match and are intended as emergency brakes while a run is in progress.
 
