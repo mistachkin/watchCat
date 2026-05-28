@@ -25,6 +25,43 @@ namespace eval ::Eagle {
   #       caller -AND- catches errors from it, optionally reporting them.
   #
   proc catchAndMaybeLog { fileName stage varName script } {
+    # <help>
+    # This procedure evaluates the specified script in the call frame of
+    # the immediate caller and, if it raises an error, opportunistically
+    # routes the failure through both the local and the remote ERROR
+    # logging paths.  It exists as the standard error-handling envelope
+    # used by the WatchCat monitor loop so that each instrumented stage
+    # can be coded as if it were straight-line code -- any thrown error
+    # is captured and the trace is uniformly attributed to the supplied
+    # file name and stage label.
+    #
+    # How it works: the script is invoked with [uplevel 1] so that
+    # variable references resolve in the caller's frame.  When [catch]
+    # reports a non-zero return code, the caller's varName variable (if
+    # any) is bound to a local alias named "changed" via [upvar 1], and
+    # then [logElapsedLocalEvent ERROR ...] and
+    # [logElapsedRemoteEvent ERROR ...] are invoked in turn, each
+    # gated by the corresponding global no(logLocalError) or
+    # no(logRemoteError) opt-out element.  On script success, this
+    # procedure does nothing further.
+    #
+    # Arguments:
+    #   fileName -- The test log file path to attribute the error to.
+    #   stage    -- A short label describing the current stage of the
+    #               monitor loop (used as the stage field of the log).
+    #   varName  -- Optional name of a caller-side changed-state array
+    #               variable.  When non-empty it is bound to the local
+    #               "changed" alias so the loggers can read/update
+    #               elapsed-time and logged-count state.  Empty skips
+    #               the upvar but the loggers are still called.
+    #   script   -- The script to evaluate, in the caller's frame, while
+    #               being protected by this error envelope.
+    #
+    # Results:
+    #   None.  The script's success result is discarded; an error from
+    #   the script is fully consumed by the logging paths.
+    # </help>
+
     if {[catch {uplevel 1 $script} error]} then {
       if {[string length $varName] > 0} then {
         upvar 1 $varName changed
@@ -46,6 +83,48 @@ namespace eval ::Eagle {
   #       to the increment.
   #
   proc shouldCountAsLogged { varName {increment 0} } {
+    # <help>
+    # This procedure inspects (and optionally updates) the WatchCat
+    # logging-change counter that tracks how many times the monitor has
+    # already emitted a logged event for the current stage.  Its primary
+    # use is by event loggers (KILL, HUNG) to know whether they are
+    # being asked to log an event that has already been counted, so that
+    # the monitor can detect whether it has produced any output for the
+    # current iteration and react accordingly.
+    #
+    # How it works: when varName is non-empty, an [upvar 1] alias named
+    # "changed" is bound to that caller variable; the array element
+    # changed(logged) is then examined.  When the element already
+    # exists, the increment (if a strict integer) is applied to it and
+    # true is returned to indicate that a counter was already in place.
+    # When the element does not exist, it is created with the value of
+    # the increment (when the increment is a strict integer; otherwise
+    # zero) and false is returned to indicate the counter was just
+    # initialized.
+    #
+    # Tricky details: the increment argument is only honored when it
+    # passes [string is integer -strict], so a non-integer value (e.g.
+    # the empty string) is silently treated as zero in both branches.
+    # The return value reports the prior existence of the counter, not
+    # the post-update value -- callers wanting the count must read it
+    # themselves through the bound alias.
+    #
+    # Arguments:
+    #   varName   -- Optional caller-side variable name to bind as the
+    #                changed-state array.  An empty value skips the
+    #                upvar (in which case the local "changed" alias
+    #                will be unbound and the routine will report false
+    #                without writing back anywhere).
+    #   increment -- Optional integer delta to apply to the
+    #                changed(logged) element (default zero, which acts
+    #                as a pure existence query when the element is
+    #                present).
+    #
+    # Results:
+    #   True if changed(logged) was already defined before this call;
+    #   false if it had to be initialized.
+    # </help>
+
     if {[string length $varName] > 0} then {
       upvar 1 $varName changed
     }
@@ -70,6 +149,29 @@ namespace eval ::Eagle {
   #       using the highest trace priority available.
   #
   proc traceMessage { message } {
+    # <help>
+    # This procedure emits a single diagnostic trace message at the
+    # highest available trace priority.  It exists so that the WatchCat
+    # logging helpers can produce traces without caring whether the
+    # current interpreter has the [dtrace] convenience command loaded;
+    # whichever path is taken, the message arrives in the trace listener.
+    #
+    # How it works: when [dtrace] is present (as detected via
+    # [info commands]), the message is forwarded to it because that
+    # form is the lowest-friction "always trace" entry point in modern
+    # Eagle builds.  Otherwise the routine falls back to the underlying
+    # [debug trace --] form, which is the long-form equivalent and is
+    # always available.
+    #
+    # Arguments:
+    #   message -- The trace message text to emit.  Passed through as-is
+    #              to whichever trace sink is selected.
+    #
+    # Results:
+    #   None.  The trace is emitted as a side effect; any value returned
+    #   by the underlying trace command is discarded.
+    # </help>
+
     if {[llength [info commands dtrace]] > 0} then {
       dtrace $message
     } else {
@@ -85,6 +187,53 @@ namespace eval ::Eagle {
   #       the associated "eagle/startup/watchCat.eagle" script file.
   #
   proc hookForCleanup { enable {quiet false} } {
+    # <help>
+    # This procedure attaches or detaches an inline anonymous-callback
+    # to the active interpreter's PreInterpreterDisposed event, so that
+    # if the tool's child shell is about to be torn down (because the
+    # current AppDomain is unloading or the process is exiting) the
+    # WatchCat monitor still gets a chance to log the hung-process
+    # condition and kill the target process before vanishing.  It is the
+    # library-side analogue of [hookPreDisposeCallbackForWatchCat] in
+    # the parent script file, with the cleanup body inlined as an
+    # [apply] expression rather than referenced by name.
+    #
+    # How it works: the registration target is built as a single-element
+    # list whose only element is an [apply] call -- that is, the
+    # registered callback is a true anonymous procedure that accepts
+    # one argument and ignores any further arguments contributed by the
+    # delegate.  The body of that anonymous procedure first removes its
+    # own callback registration (using the first two elements of
+    # [info level [info level]] to identify the anonymous callback by
+    # value), then checks whether the global ::cleanup flag is a strict
+    # true; when so, and when the global state variables ::fileName,
+    # ::pid, and ::dead are all defined, it calls [logHungProcess] and
+    # [killHungProcess] to record and kill the target.  After preparing
+    # the script, the routine fetches the active Interpreter, calls
+    # remove_PreInterpreterDisposed to clear any prior registration (so
+    # the operation is idempotent), and if enable is true follows up
+    # with add_PreInterpreterDisposed.
+    #
+    # Tricky details: the [object removecallback] inside the apply body
+    # is wrapped in [catch] because by the time it runs the interpreter
+    # is already in its dispose path and a failure to unhook must not
+    # propagate.  The slicing [lrange ... 0 1] selects exactly the apply
+    # and its lambda spec from the current level's command name and
+    # arguments, which is the form previously registered.  The cleanup
+    # body deliberately makes no assumptions about which globals are
+    # defined and uses [info exists] guards everywhere.
+    #
+    # Arguments:
+    #   enable -- A boolean.  When true, install the dispose callback;
+    #             when false, only remove any existing registration.
+    #   quiet  -- Optional boolean (default false).  When true, the
+    #             informational host-result messages are suppressed.
+    #
+    # Results:
+    #   None.  The work is performed via the interpreter object's
+    #   event-handler list.
+    # </help>
+
     set script [list apply [list [list object] {; # EComPD.DisposeCallback
       #
       # HACK: Remove event handler that called this procedure.  This
@@ -140,6 +289,44 @@ namespace eval ::Eagle {
   #       only if the specified tagged (a.k.a. "stop") file exists.
   #
   proc checkForTaggedPath { tag {path ""} } {
+    # <help>
+    # This procedure checks for the existence of a marker file that
+    # sits alongside the specified path (or, when no path is provided,
+    # alongside the current test log or current script) and whose name
+    # is the original path plus a tag suffix of the form ".TAG".  The
+    # WatchCat code uses these tagged "stop" files as a lightweight,
+    # external opt-out mechanism for various dangerous behaviors --
+    # for example, dropping a watchCat.tool.eagle.noKillProcess file
+    # next to the running tool will inhibit the [killProcess] routine
+    # for as long as that marker exists.
+    #
+    # How it works: if path is empty it is first set from [getTestLog]
+    # and, if that is also empty, from [info script] as a last resort.
+    # The tag must be a non-empty string composed entirely of four or
+    # more uppercase hex-like characters (digits and uppercase letters)
+    # to be considered valid; this restriction keeps random text from
+    # passing as an opt-out tag.  Both the base path and the path with
+    # the dot-tag suffix appended must exist on the file system for
+    # the procedure to return true.
+    #
+    # Tricky details: the tag character class is anchored at both ends
+    # and is matched case-insensitively even though the documented form
+    # uses uppercase; this is to allow lower-case tag literals at the
+    # call site.  When both [getTestLog] and [info script] are empty
+    # (e.g. when running interactively without any script context), no
+    # check is possible and false is returned.
+    #
+    # Arguments:
+    #   tag  -- The tag suffix to look for, validated against a
+    #           4-or-more-character hex-style pattern (case insensitive).
+    #   path -- Optional file path to check next to (default empty,
+    #           which triggers the test-log/info-script fallback).
+    #
+    # Results:
+    #   True if the (resolved) base path exists and the tagged file
+    #   path also exists; false in every other case.
+    # </help>
+
     if {[string length $path] == 0} then {
       set path [getTestLog]
 
@@ -166,6 +353,36 @@ namespace eval ::Eagle {
   #       undefined.
   #
   proc isProcessRunning { pid } {
+    # <help>
+    # This procedure returns whether the operating system reports the
+    # specified process id as currently running.  It is used by the
+    # WatchCat monitor and the kill-process helpers to decide whether
+    # the target needs to be killed or whether it has already exited
+    # on its own.
+    #
+    # How it works: on Windows it delegates to the core [isActiveProcess]
+    # helper, which queries the process table directly.  On POSIX
+    # systems, it invokes the external "kill -0 $pid" command via [exec
+    # -success Success --]; kill -0 is the standard POSIX idiom for "do
+    # not send a signal, only check existence", and a zero exit (mapped
+    # by -success Success) means the process exists and the caller has
+    # permission to signal it.  Any non-zero exit is treated as "not
+    # running".
+    #
+    # Tricky details: this procedure ASSUMES that a POSIX-compatible
+    # external "kill" tool is on the path; if that assumption fails,
+    # the results are undefined.  No signal is actually sent because
+    # the "-0" form is purely an existence query.
+    #
+    # Arguments:
+    #   pid -- The process identifier to check, as an integer.
+    #
+    # Results:
+    #   True when the operating system reports the process as running;
+    #   false otherwise (including the case where the process exists
+    #   but the caller does not have permission to query it).
+    # </help>
+
     if {[isWindows]} then {
       return [isActiveProcess $pid]
     } else {
@@ -183,6 +400,45 @@ namespace eval ::Eagle {
   #       time is greater than the last time it was checked.
   #
   proc hasFileChanged { fileName {varName ""} } {
+    # <help>
+    # This procedure reports whether the specified file's modification
+    # time has changed since the last time it was checked through the
+    # same change-state array.  It is the heartbeat detector that the
+    # WatchCat monitor loop uses to decide whether the target process
+    # is still emitting log output -- a target that has stopped writing
+    # to its log file for too long is treated as hung.
+    #
+    # How it works: when varName is non-empty, an [upvar 1] alias named
+    # "changed" is bound to that caller-side state array.  The current
+    # [file mtime] of the file is read into a local variable.  If the
+    # array already holds an mtime under the file name key, the result
+    # is true when that recorded mtime differs from the new one and
+    # false otherwise; if no recorded mtime exists yet, the result is
+    # unconditionally true so the first observation of any file
+    # registers as "changed".  In both cases the new mtime is stored
+    # back into the array element so the next call has a fresh baseline.
+    #
+    # Tricky details: this routine has no built-in fail-safe for
+    # missing files -- [file mtime] will raise an error if the file
+    # does not exist, so callers are expected to ensure the file is
+    # available before calling.  When varName is empty the upvar is
+    # skipped, but the local "changed" array is still used and its
+    # contents are discarded on return, making the routine always
+    # return true in that mode.
+    #
+    # Arguments:
+    #   fileName -- The path of the file whose mtime should be polled.
+    #   varName  -- Optional name of a caller-side array that records
+    #               per-file last-seen mtime values across calls.  An
+    #               empty value makes the routine stateless (and so it
+    #               always returns true).
+    #
+    # Results:
+    #   True if this is the first observation of the file in this
+    #   state array or if its mtime differs from the recorded value;
+    #   false if the mtime is the same as the recorded value.
+    # </help>
+
     if {[string length $varName] > 0} then {
       upvar 1 $varName changed
     }
@@ -205,6 +461,55 @@ namespace eval ::Eagle {
   #       associated process should be assumed to be hung).
   #
   proc isProcessHung { limit fileName {varName ""} {quiet false} } {
+    # <help>
+    # This procedure decides whether the process whose log file is the
+    # named file should be considered hung based on how long it has
+    # been since that log file's recorded modification time was last
+    # updated.  It is the higher-level companion to [hasFileChanged]:
+    # while that helper only reports change-or-no-change, this one
+    # applies the configured staleness limit and produces the boolean
+    # answer the monitor loop actually acts on.
+    #
+    # How it works: it first binds the caller's state array via
+    # [upvar 1] (when varName is non-empty), expecting the array to
+    # contain a per-file mtime element previously set by
+    # [hasFileChanged].  When that element is missing, the situation
+    # is treated as "hung" (with an ERROR-level debug message unless
+    # quiet is in effect) because the missing mtime almost certainly
+    # indicates that the monitor's bookkeeping is out of step with
+    # reality.  Otherwise the current wall-clock time from [clock
+    # seconds] is differenced against the recorded mtime and the
+    # elapsed result is also cached into changed(elapsed) for other
+    # routines to read.  When the elapsed value exceeds the limit, the
+    # routine emits an ERROR debug message describing the staleness
+    # (unless quiet) and returns true; otherwise it returns false.
+    #
+    # Tricky details: the helper captures [info level [info level]]
+    # for the leading element only, then uses that name as the prefix
+    # of its debug messages, so the messages identify themselves as
+    # coming from this procedure (including any namespace
+    # qualification).  The elapsed time is stored back into the
+    # caller's array even when the routine returns true, so that the
+    # surrounding diagnostic logging can read it.
+    #
+    # Arguments:
+    #   limit    -- The maximum permitted age of the log file's mtime
+    #               (in seconds) before the target is declared hung.
+    #   fileName -- The log file path whose mtime is being judged.
+    #   varName  -- Optional caller-side state array.  An empty value
+    #               skips the upvar (and forces the missing-mtime
+    #               branch, since the local "changed" array will have
+    #               no element under fileName).
+    #   quiet    -- Optional boolean (default false).  When true the
+    #               diagnostic debug-output messages are suppressed but
+    #               the return value is unchanged.
+    #
+    # Results:
+    #   True when the recorded mtime is missing or older than the
+    #   limit (target is declared hung); false when the mtime is
+    #   within the limit.
+    # </help>
+
     if {[string length $varName] > 0} then {
       upvar 1 $varName changed
     }
@@ -244,6 +549,44 @@ namespace eval ::Eagle {
   #       command line from the specified log file.
   #
   proc getTestRunDataFromLogFile { fileName } {
+    # <help>
+    # This procedure scans the specified log file for two characteristic
+    # header records emitted by the Eagle test framework and returns the
+    # extracted test run identifier and command line as a name/value
+    # list ready for [eval lappend]-ing into a larger status structure.
+    # It is used by the WatchCat remote-event loggers to attribute their
+    # messages to a specific test run on the monitoring server.
+    #
+    # How it works: when the file does not exist the empty list is
+    # returned.  Otherwise the entire file is slurped via [readSharedFile]
+    # (so concurrent writers do not lock the monitor out) and CRLF
+    # newlines are normalized to LF.  Two regular expressions are then
+    # matched against the data with the -skip 1 and -line switches: the
+    # first matches the canonical "**** START OF TEST LOG ... ****"
+    # banner and captures the hex identifier; the second matches the
+    # "---- original command line: ..." header and captures the
+    # remainder of the line.  Whenever a match fails the special
+    # placeholder "<unknown>" is substituted so the result list always
+    # has a stable shape.  The returned list begins with the key
+    # "TEST-RUN" followed by the identifier value, then the key
+    # "CMD-LINE" followed by the command line value.
+    #
+    # Tricky details: the result list shape is intentionally a flat
+    # key/value sequence so callers can splice it into a larger flat
+    # list via [eval lappend].  The -skip 1 switch on [regexp -line]
+    # asks the regex engine to skip continuations, ensuring that each
+    # logical record (one per line of the log) is examined once.
+    #
+    # Arguments:
+    #   fileName -- The log file path to scan.  Need not exist; a
+    #               missing file simply produces an empty result.
+    #
+    # Results:
+    #   A flat list of the form: TEST-RUN identifier CMD-LINE
+    #   commandLine, or the empty list if the file does not exist.
+    #   Missing fields are filled with the literal "<unknown>".
+    # </help>
+
     set result [list]
 
     if {[file exists $fileName]} then {
@@ -276,6 +619,48 @@ namespace eval ::Eagle {
   #       from the specified log file.
   #
   proc getPendingTestFromLogFile { fileName } {
+    # <help>
+    # This procedure scans the specified test log file to find the name
+    # of the test (if any) that has been started but has not yet
+    # reported a final result.  When the monitor declares a target hung
+    # this is the test name that will be tagged onto the diagnostic
+    # output so operators can immediately see which test is to blame.
+    #
+    # How it works: the file is slurped via [readSharedFile] with CRLF
+    # normalized to LF.  Four regular expression patterns are prepared:
+    # one matches the "---- TESTNAME start" line emitted at the
+    # beginning of each test (capturing the test name), and three match
+    # the canonical SKIPPED, PASSED/DISABLED, and FAILED/IGNORED end
+    # markers that can close out that same test.  The start pattern is
+    # applied across the entire data via [regexp -all -inline -line];
+    # the LAST capture is treated as the most recent test that began,
+    # and dot characters in the test name are escaped before it is
+    # substituted into each of the three end-marker patterns.  If none
+    # of the three end markers match for that test name, the test is
+    # considered still pending and its name is returned.  In every
+    # other case (no starts in the file, or a matching end marker
+    # found) the empty string is returned.
+    #
+    # Tricky details: the test name pattern is deliberately permissive
+    # (alphanumeric prefix, a hyphen-and-digits group, and optional
+    # dotted segments) to cover the various naming conventions used by
+    # the Eagle test suites; it is anchored on both sides via the -line
+    # switch.  The end-marker patterns use a placeholder of %testName%
+    # that is substituted with the literal test name to avoid having to
+    # interpolate user-supplied text directly into the regex source.
+    # The match for SKIPPED requires a colon followed by some
+    # non-newline text, distinguishing it from the count-line skipped
+    # variant handled in [isLogFileComplete].
+    #
+    # Arguments:
+    #   fileName -- The log file path to scan.  When missing, the empty
+    #               string is returned.
+    #
+    # Results:
+    #   The name of the last test that started but has not yet ended,
+    #   or the empty string if no such pending test can be identified.
+    # </help>
+
     if {[file exists $fileName]} then {
       #
       # HACK: These patterns make various assumptions about how the
@@ -342,6 +727,44 @@ namespace eval ::Eagle {
   #       the command line, and the current pending test name.
   #
   proc getLogFileStatus { fileName } {
+    # <help>
+    # This procedure collects a snapshot of everything the WatchCat
+    # logging code wants to know about the current state of a target
+    # log file -- its size, its modification time, the test run
+    # identifier and command line extracted by
+    # [getTestRunDataFromLogFile], and the currently pending test name
+    # from [getPendingTestFromLogFile] -- and returns it as a flat
+    # key/value list ready to be embedded in remote-event messages.
+    #
+    # How it works: it returns the literal "<missing>" immediately when
+    # the file does not exist.  Otherwise it walks several
+    # information-gathering steps in turn, each wrapped in [catch] so
+    # that a failure of one step (for example, [file size] failing on
+    # a transiently locked file) does not derail the others.  On
+    # success each step appends its key and value to the result list;
+    # on failure each step appends the corresponding error message to
+    # a parallel errors list.  Steps include reading the size, the
+    # mtime, the test run data, and the pending test name (with
+    # "<none>" substituted when there is no pending test).  If any
+    # error was accumulated, an "errors" key followed by the errors
+    # list is appended to the result so callers can see what went
+    # wrong without losing the data that was successfully gathered.
+    #
+    # Tricky details: the pending-test step explicitly substitutes
+    # "<none>" so that the status structure remains shape-stable across
+    # the pending-vs-not-pending distinction.  The errors element, when
+    # present, is itself a nested list because the inner errors list
+    # is added as a single value rather than spliced; this keeps the
+    # outer status list short and well-formed.
+    #
+    # Arguments:
+    #   fileName -- The log file path whose status should be gathered.
+    #
+    # Results:
+    #   A flat key/value list summarizing the log file's status, or
+    #   the literal "<missing>" when the file does not exist on disk.
+    # </help>
+
     if {[file exists $fileName]} then {
       set result [list]
       set errors [list]
@@ -395,6 +818,31 @@ namespace eval ::Eagle {
   #       the specified value.
   #
   proc removeTestRun { value } {
+    # <help>
+    # This procedure strips the "TEST-RUN HEXID" substring (and one of
+    # the spaces surrounding it) out of a status or log-file-info
+    # string so that the value can be embedded in a larger remote-event
+    # message without doubling up the test run identifier.  It exists
+    # because the remote-event logger emits the test run identifier
+    # explicitly as its own field, and would otherwise show the same
+    # value redundantly inside an inline status payload.
+    #
+    # How it works: it runs a single [regsub -all] over the value,
+    # matching a literal space followed by "TEST-RUN", another space,
+    # one or more uppercase hex characters, and a trailing whitespace
+    # group; the trailing whitespace is captured and re-emitted via the
+    # \1 replacement reference so that adjacent content is not jammed
+    # together by the deletion.  The transformed value is returned.
+    #
+    # Arguments:
+    #   value -- The input string from which to strip the TEST-RUN
+    #            field, typically a key/value list produced by
+    #            [getLogFileStatus].
+    #
+    # Results:
+    #   The input value with every "TEST-RUN HEXID" occurrence removed.
+    # </help>
+
     regsub -all -- { TEST-RUN [0-9A-F]+(\s+)} $value {\1} value
     return $value
   }
@@ -407,6 +855,31 @@ namespace eval ::Eagle {
   #       is not concerned with that case.
   #
   proc getOverallResultPattern {} {
+    # <help>
+    # This procedure returns the regular expression pattern used to
+    # identify the canonical "OVERALL RESULT" line emitted at the end
+    # of a complete test run, together with its allowed result-name
+    # alternatives and the optional pass-rate threshold annotation in
+    # parentheses.  It is factored out so that any callers wanting to
+    # parse that line use exactly the same pattern, ensuring future
+    # additions to the result vocabulary need only be updated once.
+    #
+    # How it works: the pattern is built up via [appendArgs] from three
+    # source fragments -- an anchored "OVERALL RESULT: " prefix, a
+    # capturing alternation listing the five known result names (NONE,
+    # SUCCESS, FAILURE, STOP-ON-FAILURE, and STOP-ON-LEAK), and an
+    # optional non-capturing group matching the pass-rate annotation
+    # of the form "(N% >= M%)" or "(N% < M%)" -- and the resulting
+    # pattern string is returned.
+    #
+    # Arguments:
+    #   None.
+    #
+    # Results:
+    #   A regular expression string suitable for use with
+    #   [regexp -line] against test log file data.
+    # </help>
+
     return [appendArgs \
         {^OVERALL RESULT: } \
         {(NONE|SUCCESS|FAILURE|STOP-ON-FAILURE|STOP-ON-LEAK)} \
@@ -418,6 +891,35 @@ namespace eval ::Eagle {
   #       the context of the immediate caller.
   #
   proc maybeAppendTo { varName value } {
+    # <help>
+    # This procedure conditionally appends a string to a variable in
+    # the call frame of the immediate caller, automatically inserting
+    # a separator space when the variable already has a non-empty
+    # value.  It is used by the stage-building code in
+    # [isLogFileComplete] to incrementally accumulate descriptive
+    # tokens such as "missing-result", "bad-result", "skipped N", and
+    # so on without each accumulation site having to repeat the
+    # presence-and-separator boilerplate.
+    #
+    # How it works: when varName is non-empty an [upvar 1] alias named
+    # "local" is bound to the caller's variable; if that variable
+    # already exists and contains a non-empty string, a single ASCII
+    # space is appended before the new value to keep tokens visually
+    # separated.  The new value itself is then appended.  When varName
+    # is empty the procedure does nothing -- this lets callers pass
+    # through their own optional stage-name argument unchanged when
+    # the caller does not want any accumulation at all.
+    #
+    # Arguments:
+    #   varName -- The name of the caller-side variable to append to.
+    #              When empty, the procedure is a no-op.
+    #   value   -- The string to append.
+    #
+    # Results:
+    #   None.  The work is performed via side effects on the bound
+    #   variable.
+    # </help>
+
     if {[string length $varName] > 0} then {
       upvar 1 $varName local
 
@@ -435,6 +937,60 @@ namespace eval ::Eagle {
   #       represents a complete test suite run.
   #
   proc isLogFileComplete { fileName varName } {
+    # <help>
+    # This procedure decides whether the contents of the specified log
+    # file represent a complete and successful test suite run, with a
+    # well-formed "OVERALL RESULT" line and at least one matching
+    # remote-result-logging record.  As a side effect it can populate
+    # a caller-side "stage" variable with one or more short tokens
+    # describing why the log was judged incomplete, when that is the
+    # answer.
+    #
+    # How it works: it first builds the set of pattern fragments
+    # needed for the various forms the success and failure status
+    # lines can take in the test suite output -- a prefix shared by
+    # both success and failure remote-logging lines, optional OK count
+    # forms, ERROR forms with optional brace-quoted detail messages,
+    # and the rare FAILURE form which currently appears with no
+    # message.  These fragments are combined into three full patterns
+    # for the result-logging line variants (single result, single
+    # form with explicit braces, and multiple brace-quoted results),
+    # plus two patterns matching the SKIPPED-count and SKIPPED-names
+    # summary records.  The full file is then slurped via
+    # [readSharedFile] with CRLF normalized, and tested in turn
+    # against the OVERALL RESULT pattern from [getOverallResultPattern];
+    # missing results, unrecognized results, and uncategorized failures
+    # are all reported through [maybeAppendTo stage ...] with the
+    # appropriate token before a false return.  Only SUCCESS and
+    # FAILURE are treated as final; NONE, STOP-ON-FAILURE, and
+    # STOP-ON-LEAK are explicitly flagged as bad results.  When the
+    # OVERALL RESULT and at least one remote-logging line are present,
+    # the procedure also opportunistically captures any SKIPPED count
+    # or names summary into the stage variable before returning true.
+    #
+    # Tricky details: the patterns rely on the {N,M} regexp quantifier
+    # syntax expressed in normal Tcl/Eagle regular expression form,
+    # with the special characters needed for braces escaped with
+    # backslashes where they appear in subPattern(3); these escapes
+    # are necessary because the surrounding [appendArgs] arguments are
+    # plain words rather than brace-quoted strings.  The failure form
+    # is deliberately simplified to the bare word "FAILURE" because
+    # the test framework currently does not emit a detail message for
+    # that variant.
+    #
+    # Arguments:
+    #   fileName -- The log file path to evaluate.
+    #   varName  -- Optional name of a caller-side variable to receive
+    #               accumulated stage tokens describing why the log
+    #               was deemed incomplete.  An empty value disables
+    #               the accumulation.
+    #
+    # Results:
+    #   True if the log file represents a complete run; false
+    #   otherwise (in which case the stage variable, if any, holds
+    #   diagnostic tokens identifying the failure mode).
+    # </help>
+
     if {[string length $varName] > 0} then {
       upvar 1 $varName stage
     }
@@ -508,6 +1064,62 @@ namespace eval ::Eagle {
   proc isProcessSuccess {
           fileName pid deadVarName statusVarName stageVarName
           {milliseconds 60000} } {
+    # <help>
+    # This procedure performs the WatchCat tool's end-of-run
+    # post-mortem -- it pauses long enough for the target process to
+    # finish exiting, then evaluates whether the target was killed by
+    # this tool, whether the log file reached completeness, and
+    # whether the target process is no longer running, and combines
+    # those three signals into a single boolean success answer plus
+    # a human-readable status list of all three observations.
+    #
+    # How it works: after binding the supplied dead, status, and
+    # stage variable names via [upvar 1] (each gated by a length
+    # check), it sleeps for the supplied number of milliseconds via
+    # [after] to give the target a chance to clean up.  It then
+    # runs three checks, each appending a "target process N was/not
+    # killed", "log file \"...\" complete/incomplete", or "target
+    # process N is running/is dead" entry to the status list and
+    # incrementing the result counter on every failing signal.  The
+    # log-file completeness check delegates to [isLogFileComplete],
+    # which can populate the stage variable as a side effect.  The
+    # routine returns true only when the result counter is zero,
+    # meaning the target was killed by this tool, the log file is
+    # complete, and the process has actually exited.
+    #
+    # Tricky details: counter-intuitively, "target killed" counts as
+    # a SUCCESS signal (so its absence increments the failure
+    # counter), because in the WatchCat tool's worldview the only
+    # reason this post-mortem runs is because the tool intervened.
+    # The [after] sleep is performed unconditionally because the
+    # surrounding caller has already determined that intervention has
+    # occurred and wants to allow the process to die before the final
+    # snapshot.
+    #
+    # Arguments:
+    #   fileName       -- The log file path being judged for
+    #                     completeness.
+    #   pid            -- The process identifier of the target.
+    #   deadVarName    -- Optional caller-side variable that records
+    #                     whether the kill helper succeeded.  Empty
+    #                     skips the upvar.
+    #   statusVarName  -- Optional caller-side variable that will
+    #                     receive the appended human-readable status
+    #                     list.  Empty skips the upvar.
+    #   stageVarName   -- Optional caller-side variable forwarded to
+    #                     [isLogFileComplete] for stage-token
+    #                     accumulation.
+    #   milliseconds   -- Optional sleep duration before the
+    #                     post-mortem snapshot (default 60000, i.e.
+    #                     one minute).
+    #
+    # Results:
+    #   True if all three success signals held; false if any of them
+    #   indicated a problem.  In either case the status (and stage)
+    #   variables hold descriptive output describing the observed
+    #   state.
+    # </help>
+
     if {[string length $deadVarName] > 0} then {
       upvar 1 $deadVarName dead
     }
@@ -551,6 +1163,30 @@ namespace eval ::Eagle {
   #       same message to the configured remote server.
   #
   proc logWatchMessage { message } {
+    # <help>
+    # This procedure emits a single WatchCat diagnostic message both
+    # to the local trace stream (via [traceMessage]) and to the
+    # configured remote logging server (via either the direct
+    # [logRemoteMessage] or the wrapper [logRemoteMessageWrapper],
+    # depending on the no(directLogRemoteMessage) opt-out).  It exists
+    # as the common path through which every remote-event logger in
+    # this file ultimately announces itself, so a single opt-out lets
+    # the operator switch between the wrapper (which adds rate
+    # limiting and queuing) and the direct call (which is unbuffered).
+    #
+    # How it works: the message is first sent through [traceMessage]
+    # to produce a local trace entry.  Then the global
+    # no(directLogRemoteMessage) flag is consulted: when present, the
+    # wrapper variant of the remote-message helper is invoked; when
+    # absent, the direct variant is invoked.
+    #
+    # Arguments:
+    #   message -- The message text to log locally and remotely.
+    #
+    # Results:
+    #   None.  Output is produced as a side effect.
+    # </help>
+
     traceMessage $message
 
     if {[info exists ::no(directLogRemoteMessage)]} then {
@@ -566,6 +1202,45 @@ namespace eval ::Eagle {
   #
   proc logElapsedLocalEvent {
           event fileName stage varName {message ""} } {
+    # <help>
+    # This procedure writes a local test-log entry summarizing an
+    # event of interest (such as a HUNG, KILL, or ERROR) that occurred
+    # for the target test process, including the wall-clock duration
+    # since the log file last changed.  Because the target process
+    # and the WatchCat tool share the same test log file, the entry
+    # appears within that log immediately adjacent to the events that
+    # provoked it.
+    #
+    # How it works: it first honors the no(logElapsedLocalEvent)
+    # global opt-out, returning quietly when set.  When varName is
+    # non-empty an [upvar 1] alias named "changed" is bound; the
+    # elapsed time is read from the changed(elapsed) element if
+    # present, otherwise the literal "<unknown>" is used.  The
+    # current log status is gathered via [getLogFileStatus], and a
+    # formatted line of the form ==== "FILE" EVENT_LOG_FILE stage
+    # STAGE elapsed N commandLine CMDLINE [message {MSG}] is built
+    # via [appendArgs].  When a message is supplied it is appended in
+    # brace-quoted form to keep its boundaries unambiguous.  A
+    # trailing newline is appended and the line is passed to [tlog],
+    # which writes it to the test log; the call is wrapped in
+    # [catch] so an inability to log does not propagate further.
+    #
+    # Arguments:
+    #   event    -- The event tag string (for example HUNG, KILL, or
+    #               ERROR) to embed in the log line.
+    #   fileName -- The log file path being attributed.
+    #   stage    -- The stage label describing the current monitor
+    #               step.
+    #   varName  -- Optional caller-side changed-state array name.
+    #               Empty skips the upvar (and forces the elapsed
+    #               value to the literal "<unknown>").
+    #   message  -- Optional human-readable detail message.  When
+    #               empty no message clause is emitted.
+    #
+    # Results:
+    #   None.  All output is via the [tlog] side effect.
+    # </help>
+
     if {![info exists ::no(logElapsedLocalEvent)]} then {
       if {[string length $varName] > 0} then {
         upvar 1 $varName changed
@@ -606,6 +1281,42 @@ namespace eval ::Eagle {
   #
   proc logLocalEvent {
           event fileName last alive status stage {message ""} } {
+    # <help>
+    # This procedure writes a local test-log entry summarizing a
+    # one-shot event of interest (such as a DONE or CRASH) for the
+    # target test process, including snapshot context such as the
+    # time of last activity, whether the target was alive at the
+    # moment of inspection, and the gathered log file status.  It is
+    # the snapshot-style companion to [logElapsedLocalEvent], which
+    # focuses on duration rather than discrete moments.
+    #
+    # How it works: it honors the no(logLocalEvent) global opt-out,
+    # then collects [getLogFileStatus] for the file and normalizes
+    # an empty status string to "<none>".  The formatted line is of
+    # the form ==== "FILE" EVENT_LOG_FILE with LOGSTATUS last LAST
+    # alive ALIVE status STATUS stage STAGE [message {MSG}], built
+    # via [appendArgs], followed by a newline; the resulting string
+    # is passed to [tlog] inside a [catch] so logging failures are
+    # swallowed.
+    #
+    # Arguments:
+    #   event    -- The event tag string (for example DONE or
+    #               CRASH).
+    #   fileName -- The log file path being attributed.
+    #   last     -- A descriptive value for the "last activity"
+    #               field as observed by the caller.
+    #   alive    -- A descriptive value for the "process alive"
+    #               field as observed by the caller.
+    #   status   -- A descriptive value for the "status" field, or
+    #               the empty string which is rendered as "<none>".
+    #   stage    -- A short label naming the current stage.
+    #   message  -- Optional human-readable detail message; an empty
+    #               value suppresses the message clause.
+    #
+    # Results:
+    #   None.  All output is via the [tlog] side effect.
+    # </help>
+
     if {![info exists ::no(logLocalEvent)]} then {
       set logStatus [getLogFileStatus $fileName]
 
@@ -640,6 +1351,44 @@ namespace eval ::Eagle {
   #
   proc logElapsedRemoteEvent {
           event fileName stage varName {message ""} } {
+    # <help>
+    # This procedure emits an event-of-interest report to the remote
+    # logging server with a duration field measuring how long the
+    # condition lasted before being reported.  It is the remote-side
+    # companion to [logElapsedLocalEvent] and is used by the WatchCat
+    # monitor loop to notify the centralized monitoring system when a
+    # KILL, HUNG, or ERROR event is detected.
+    #
+    # How it works: it honors the no(logElapsedRemoteEvent) global
+    # opt-out and binds the caller's changed-state array via
+    # [upvar 1] (when varName is non-empty).  The current log status
+    # is gathered from [getLogFileStatus] and the elapsed time is
+    # extracted from changed(elapsed) when present (with "<unknown>"
+    # as a fallback).  A formatted MONITOR-prefixed message is built
+    # via [appendArgs], including the event tag, the test run
+    # identifier and command line pulled out of the status dictionary
+    # via [getDictionaryValue], the host name, the log file path,
+    # the stage label, and the elapsed time.  When a message is
+    # supplied it is appended as " message MSG" without brace quoting
+    # (because the remote receiver tokenizes differently than the
+    # local log).  The completed message is sent via [logWatchMessage]
+    # inside a [catch] so transient send failures (missing API key,
+    # connectivity, etc.) are silently ignored.
+    #
+    # Arguments:
+    #   event    -- The event tag string (HUNG, KILL, or ERROR).
+    #   fileName -- The log file path being attributed.
+    #   stage    -- The stage label naming the current monitor step.
+    #   varName  -- Optional caller-side changed-state array name.
+    #               Empty skips the upvar (and forces elapsed to be
+    #               "<unknown>").
+    #   message  -- Optional human-readable detail message; empty
+    #               suppresses the message clause.
+    #
+    # Results:
+    #   None.  Output is produced via [logWatchMessage] side effect.
+    # </help>
+
     if {![info exists ::no(logElapsedRemoteEvent)]} then {
       if {[string length $varName] > 0} then {
         upvar 1 $varName changed
@@ -681,6 +1430,43 @@ namespace eval ::Eagle {
   #
   proc logRemoteEvent {
           event fileName last alive status stage {message ""} } {
+    # <help>
+    # This procedure emits a snapshot-style report to the remote
+    # logging server, describing a one-shot event of interest (such
+    # as a PING, DONE, or CRASH) for the target test process along
+    # with the gathered log file status and recently observed liveness
+    # signals.  It is the snapshot-style companion to
+    # [logElapsedRemoteEvent], which carries duration information.
+    #
+    # How it works: it honors the no(logRemoteEvent) global opt-out,
+    # then collects [getLogFileStatus] and computes the elapsed time
+    # as the difference between the current [clock seconds] and the
+    # mtime stored in the status dictionary; when that mtime is not a
+    # strict integer the literal "<unknown>" is substituted.  An
+    # empty status string is normalized to "<none>".  A formatted
+    # MONITOR-prefixed message is built via [appendArgs] containing
+    # the event tag, the test run identifier, the host name, the log
+    # file path, the test-run-stripped status string from
+    # [removeTestRun], the last, alive, elapsed, status, and stage
+    # fields, and an optional message field appended without brace
+    # quoting.  The completed message is dispatched via
+    # [logWatchMessage] inside a [catch] so transient remote-logging
+    # failures are silently ignored.
+    #
+    # Arguments:
+    #   event    -- The event tag string (PING, DONE, or CRASH).
+    #   fileName -- The log file path being attributed.
+    #   last     -- A descriptive value for the "last activity" field.
+    #   alive    -- A descriptive value for the "process alive" field.
+    #   status   -- The status field, or empty (rendered as "<none>").
+    #   stage    -- The stage label naming the current monitor step.
+    #   message  -- Optional human-readable detail message; empty
+    #               suppresses the message clause.
+    #
+    # Results:
+    #   None.  Output is produced via [logWatchMessage] side effect.
+    # </help>
+
     if {![info exists ::no(logRemoteEvent)]} then {
       set logStatus [getLogFileStatus $fileName]
 
@@ -725,6 +1511,39 @@ namespace eval ::Eagle {
   #       place.
   #
   proc logPing { fileName last alive status stage } {
+    # <help>
+    # This procedure records that a PING heartbeat observation took
+    # place against the target test process.  It is invoked from the
+    # WatchCat monitor loop on each iteration regardless of whether
+    # the target appears hung, so the remote monitoring system can
+    # tell the difference between "this monitor is alive and the
+    # target is making progress" and "this monitor stopped reporting
+    # entirely".
+    #
+    # How it works: subject to the no(logRemotePing) opt-out, the
+    # ping information is forwarded to [logRemoteEvent] with the
+    # event tag PING.  No local logging is performed.
+    #
+    # Tricky details: as noted by the BUGBUG comment in the body,
+    # this procedure deliberately does NOT call [logLocalEvent] --
+    # writing to the local test log would update its modification
+    # time and defeat the very hang-detection mechanism that
+    # [hasFileChanged]/[isProcessHung] depend on.
+    #
+    # Arguments:
+    #   fileName -- The log file path being attributed.
+    #   last     -- The "last activity" field forwarded to the
+    #               remote logger.
+    #   alive    -- The "process alive" field forwarded to the
+    #               remote logger.
+    #   status   -- The status field forwarded to the remote logger
+    #               (empty becomes "<none>").
+    #   stage    -- The stage label forwarded to the remote logger.
+    #
+    # Results:
+    #   None.  Side effects only.
+    # </help>
+
     #
     # BUGBUG: Actually, this procedure cannot log anything
     #         locally.  If it did, it would prevent "hung"
@@ -741,6 +1560,32 @@ namespace eval ::Eagle {
   #       place.
   #
   proc logDone { fileName last alive status stage } {
+    # <help>
+    # This procedure records that the target test process has
+    # finished its work cleanly, emitting a DONE event to both the
+    # local test log (so the run's transcript ends with the WatchCat
+    # observation) and the remote monitoring server (so the
+    # centralized view marks the run as complete).
+    #
+    # How it works: subject to the no(tlogDone) opt-out it forwards
+    # to [logLocalEvent] with event tag DONE, and subject to the
+    # no(logRemoteDone) opt-out it forwards to [logRemoteEvent] with
+    # the same tag.  Either or both opt-outs can be set to suppress
+    # the corresponding leg of the report.
+    #
+    # Arguments:
+    #   fileName -- The log file path being attributed.
+    #   last     -- The "last activity" field forwarded to both
+    #               loggers.
+    #   alive    -- The "process alive" field forwarded to both
+    #               loggers.
+    #   status   -- The status field forwarded to both loggers.
+    #   stage    -- The stage label forwarded to both loggers.
+    #
+    # Results:
+    #   None.  Side effects only.
+    # </help>
+
     if {![info exists ::no(tlogDone)]} then {
       logLocalEvent DONE $fileName $last $alive $status $stage
     }
@@ -755,6 +1600,30 @@ namespace eval ::Eagle {
   #       place.
   #
   proc logCrash { fileName last alive status stage } {
+    # <help>
+    # This procedure records that the target test process appears to
+    # have crashed (i.e. exited without producing the expected
+    # completeness markers in its log file), emitting a CRASH event
+    # to both the local test log and the remote monitoring server.
+    #
+    # How it works: subject to the no(tlogCrash) opt-out it forwards
+    # to [logLocalEvent] with event tag CRASH, and subject to the
+    # no(logRemoteCrash) opt-out it forwards to [logRemoteEvent] with
+    # the same tag.
+    #
+    # Arguments:
+    #   fileName -- The log file path being attributed.
+    #   last     -- The "last activity" field forwarded to both
+    #               loggers.
+    #   alive    -- The "process alive" field forwarded to both
+    #               loggers.
+    #   status   -- The status field forwarded to both loggers.
+    #   stage    -- The stage label forwarded to both loggers.
+    #
+    # Results:
+    #   None.  Side effects only.
+    # </help>
+
     if {![info exists ::no(tlogCrash)]} then {
       logLocalEvent CRASH $fileName $last $alive $status $stage
     }
@@ -769,6 +1638,35 @@ namespace eval ::Eagle {
   #       place.
   #
   proc logKillProcess { fileName stage varName } {
+    # <help>
+    # This procedure records that the WatchCat tool has decided to
+    # kill the target test process, emitting a KILL event to both the
+    # local test log and the remote monitoring server with elapsed
+    # duration since the log file last changed.  Each successful leg
+    # also bumps the changed(logged) counter via [shouldCountAsLogged]
+    # so the surrounding monitor loop can detect that progress has
+    # been recorded.
+    #
+    # How it works: when varName is non-empty an [upvar 1] alias
+    # named "changed" is bound to the caller's state array.
+    # Subject to the no(tlogKillProcess) opt-out, the routine forwards
+    # to [logElapsedLocalEvent KILL ...] and increments the logged
+    # counter by 1.  Subject to the no(logRemoteKillProcess) opt-out
+    # it forwards to [logElapsedRemoteEvent KILL ...] and again
+    # increments the logged counter by 1; the counter therefore
+    # reaches 2 when both legs are enabled.
+    #
+    # Arguments:
+    #   fileName -- The log file path being attributed.
+    #   stage    -- The stage label naming the current monitor step.
+    #   varName  -- Optional caller-side changed-state array name
+    #               used both for elapsed-time lookup and counter
+    #               increment.  Empty skips the upvar.
+    #
+    # Results:
+    #   None.  Side effects only.
+    # </help>
+
     if {[string length $varName] > 0} then {
       upvar 1 $varName changed
     }
@@ -789,6 +1687,33 @@ namespace eval ::Eagle {
   #       place.
   #
   proc logHungProcess { fileName stage varName } {
+    # <help>
+    # This procedure records that the WatchCat tool has decided the
+    # target test process is hung, emitting a HUNG event to both the
+    # local test log and the remote monitoring server with the
+    # elapsed duration of the staleness, and bumping the logged
+    # counter for each successfully sent leg.  It is typically
+    # called immediately before [killHungProcess] so the diagnostic
+    # output is captured before the target is killed.
+    #
+    # How it works: when varName is non-empty an [upvar 1] alias
+    # named "changed" is bound to the caller's state array.  Subject
+    # to the no(tlogHungProcess) opt-out it forwards to
+    # [logElapsedLocalEvent HUNG ...] and increments the logged
+    # counter by 1.  Subject to the no(logRemoteHungProcess) opt-out
+    # it forwards to [logElapsedRemoteEvent HUNG ...] and again
+    # increments the logged counter.
+    #
+    # Arguments:
+    #   fileName -- The log file path being attributed.
+    #   stage    -- The stage label naming the current monitor step.
+    #   varName  -- Optional caller-side changed-state array name.
+    #               Empty skips the upvar.
+    #
+    # Results:
+    #   None.  Side effects only.
+    # </help>
+
     if {[string length $varName] > 0} then {
       upvar 1 $varName changed
     }
@@ -809,6 +1734,63 @@ namespace eval ::Eagle {
   #       entire process group.
   #
   proc killProcess { pid varName {force true} {group false} } {
+    # <help>
+    # This procedure attempts to terminate the specified target
+    # process, optionally extending the kill to the entire POSIX
+    # process group on non-Windows systems.  It is the workhorse used
+    # by [killHungProcess] (when the target has stopped responding)
+    # and by [killProcessAndSelf] (during experimental tidy-up
+    # cleanup), and it offers several layers of safety -- both an
+    # in-process global opt-out and an external marker-file opt-out
+    # via [checkForTaggedPath noKillProcess].
+    #
+    # How it works: the procedure first refuses to act when the
+    # global no(killProcess) opt-out is set or when a
+    # ".noKillProcess" tagged marker file exists alongside the
+    # current log or script path.  When neither opt-out applies and
+    # the force flag is false, it requires the process to currently
+    # be running (raising an error if it is already dead) so callers
+    # can use the routine as a "kill if alive" rather than a
+    # blind kill.  The actual termination is wrapped in [catch] and
+    # branches on platform: on Windows it uses the core [kill
+    # -force --] command (which is rare here because Eagle processes
+    # typically do not hang on Windows); on POSIX, if the group
+    # argument is true and [maybeKillProcessGroup] exists and
+    # succeeds, the entire process group is killed (potentially
+    # taking this script down with it), otherwise the target alone
+    # is killed via "exec kill -s KILL".  When varName is non-empty
+    # an [upvar 1] alias named "dead" is bound and set to true on
+    # successful kill so the caller knows the action took place.
+    #
+    # Tricky details: killing the process group is described as the
+    # extreme measure used when ordinary kills are insufficient (the
+    # original motivation was hangs in the Demo plugin test suite
+    # spawning nested shells that were not directly tracked).
+    # Killing the group may also kill this very script, which is
+    # accepted as the cost of doing business in that scenario.  The
+    # whole [catch] envelope is what produces the boolean return:
+    # any failure inside the kill block results in a false return
+    # value (and no caller-side "dead" update), whereas a clean kill
+    # returns true.
+    #
+    # Arguments:
+    #   pid     -- The process identifier of the target to kill.
+    #   varName -- Optional caller-side variable name that will be
+    #              set to true when a successful kill occurs.  Empty
+    #              skips the upvar.
+    #   force   -- Optional boolean (default true).  When false the
+    #              routine errors out if the target is already dead;
+    #              when true it always attempts the kill.
+    #   group   -- Optional boolean (default false).  When true on
+    #              POSIX, attempts to kill the entire process group
+    #              via [maybeKillProcessGroup] before falling back to
+    #              a single-process kill.
+    #
+    # Results:
+    #   True if the target was killed by this call; false if any of
+    #   the opt-outs applied or the kill operation failed.
+    # </help>
+
     #
     # HACK: Allow external code to forbid the killing of a
     #       process, both via setting a global array element
@@ -888,6 +1870,42 @@ namespace eval ::Eagle {
   #       current process.
   #
   proc killProcessAndSelf { pid varName {force true} {group false} } {
+    # <help>
+    # This procedure is an experimental "tidy-up" variant of
+    # [killProcess] that, after killing the target, also kills the
+    # current process so that nothing of the WatchCat tooling
+    # lingers after a hang has been detected.  It exists to address
+    # cases where leaving the monitor child process running would
+    # be more confusing than useful.
+    #
+    # How it works: it first honors both the global
+    # no(killProcessAndSelf) opt-out and the
+    # ".noKillProcessAndSelf" external marker-file opt-out via
+    # [checkForTaggedPath].  When neither opt-out applies it binds
+    # the caller's "dead" variable via [upvar 1] (when varName is
+    # non-empty), calls [killProcess] on the target pid, then calls
+    # [killProcess] on the current process via [pid].  As a
+    # safeguard against ever returning normally, the procedure
+    # finally raises an "why am I still alive?" error if execution
+    # reaches that point -- the only sanctioned outcome is for
+    # control to leave via process termination.
+    #
+    # Arguments:
+    #   pid     -- The process identifier of the target to kill.
+    #   varName -- Optional caller-side variable name that will be
+    #              set to true on successful target kill.  Empty
+    #              skips the upvar.
+    #   force   -- Optional boolean (default true).  Forwarded to
+    #              both internal [killProcess] calls.
+    #   group   -- Optional boolean (default false).  Forwarded to
+    #              both internal [killProcess] calls.
+    #
+    # Results:
+    #   This procedure is not expected to return.  If it does (no
+    #   opt-out applied and the kill calls failed to terminate the
+    #   process), it raises a script error.
+    # </help>
+
     #
     # NOTE: This procedure is an experimental attempt to
     #       kill the target process and this process as a
@@ -911,6 +1929,49 @@ namespace eval ::Eagle {
   #       now regarded as being hopelessly hung.
   #
   proc killHungProcess { fileName pid varName stage {force true} } {
+    # <help>
+    # This procedure terminates a target test process that the
+    # WatchCat monitor has classified as hung.  It is the public
+    # entry point used by the monitor loop and by the dispose-time
+    # cleanup callback, and it always invokes [killProcess] with
+    # the group flag enabled so that any nested shells spawned by
+    # the hung test suite are also taken down.
+    #
+    # How it works: it first honors the global no(killHungProcess)
+    # opt-out and the ".noKillHungProcess" external marker-file
+    # opt-out via [checkForTaggedPath].  When neither applies, it
+    # binds the caller's "dead" variable via [upvar 1] (when
+    # varName is non-empty) and forwards to [killProcess] with the
+    # group argument set to true, returning whatever
+    # [killProcess] returns.  When either opt-out applies, the
+    # routine returns false without taking any action.
+    #
+    # Tricky details: the fileName and stage arguments are
+    # presently accepted for symmetry with the other logging
+    # entry points and consistency of call-site shape; the
+    # routine itself does not use them.  Earlier-iteration callers
+    # would typically have called [logHungProcess] separately
+    # before this routine.
+    #
+    # Arguments:
+    #   fileName -- The log file path associated with the hang
+    #               (currently unused by the body, retained for
+    #               symmetry and forward compatibility).
+    #   pid      -- The process identifier of the hung target.
+    #   varName  -- Optional caller-side "dead" variable name set
+    #               by the underlying kill.  Empty skips the
+    #               upvar.
+    #   stage    -- The stage label naming the current monitor
+    #               step (currently unused by the body, retained
+    #               for symmetry and forward compatibility).
+    #   force    -- Optional boolean (default true).  Forwarded to
+    #               [killProcess].
+    #
+    # Results:
+    #   True if the underlying [killProcess] reported success;
+    #   false if an opt-out applied or the kill failed.
+    # </help>
+
     #
     # NOTE: The specified (log) file has not been changed
     #       in a very long time; assume target process is

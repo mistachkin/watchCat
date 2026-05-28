@@ -25,6 +25,46 @@
 #
 namespace eval ::Eagle {
   proc preDisposeCallbackForWatchCat { object } {; # EComPD.DisposeCallback
+    # <help>
+    # This procedure is the dispose-callback that the WatchCat hooking layer
+    # attaches to the active interpreter's PreInterpreterDisposed event.  It
+    # exists so that, when the hosting interpreter is being torn down, every
+    # piece of state that the WatchCat tooling installed into the running
+    # interpreter is cleanly reversed -- the hooked test-log procedures are
+    # restored to their original implementations, any external log monitor
+    # child process that is still running is killed, and the event handler
+    # itself is unhooked because the interpreter will never invoke it again.
+    #
+    # How it works: it first uses the well-known "info level" trick to obtain
+    # the fully-qualified name of the currently executing procedure (so that
+    # the registered callback can be identified and removed via [object
+    # removecallback] without having to hard-code its name).  It then calls
+    # the unhook helpers for the saved [getTestLog] and [newTestLog] overrides
+    # with their enable flag set to false (which is how those helpers signal
+    # the "restore original" code path), invokes the external log monitor
+    # cleanup routine to terminate any surviving child process, and finally
+    # tells the event-hooking helper to unregister this very procedure from
+    # the PreInterpreterDisposed event.
+    #
+    # Tricky details: the leading [catch] around the removecallback call is
+    # deliberate -- by the time this fires the interpreter is already in a
+    # dispose path, so failing to remove the callback must not propagate an
+    # error and abort the rest of the cleanup.  The argument signature is
+    # dictated by the Eagle.Components.Public.DisposeCallback delegate; the
+    # "object" parameter is the interpreter being disposed and is accepted
+    # for delegate compatibility but is not used directly by the body.
+    #
+    # Arguments:
+    #   object -- The handle of the interpreter that is being disposed, as
+    #             supplied by the PreInterpreterDisposed event.  It is not
+    #             read by this procedure; it exists only to match the
+    #             delegate signature expected by the event source.
+    #
+    # Results:
+    #   None.  Any return value is discarded by the event dispatcher.  All
+    #   work is performed via side effects on the running interpreter.
+    # </help>
+
     #
     # NOTE: First, remove the event handler that called this procedure.
     #
@@ -53,6 +93,32 @@ namespace eval ::Eagle {
   }
 
   proc getCallerNameForWatchCat {} {
+    # <help>
+    # This procedure returns the name of the procedure that invoked the
+    # immediate caller of this procedure (i.e. it walks the call stack up
+    # by two frames).  It exists so that the WatchCat hook procedures can
+    # identify who originally invoked the procedure they have replaced --
+    # this is used when the saved test-log helper is missing, so that the
+    # resulting diagnostic error message can attribute the failure to a
+    # meaningful caller name rather than to the hook procedure itself.
+    #
+    # How it works: it uses [info level -2] to inspect the call frame two
+    # levels above its own, and takes the first element (the procedure
+    # name and any leading arguments are returned as a list, of which the
+    # zeroth element is the procedure name).  The lookup is wrapped in a
+    # [catch] so that, if there is no such frame (for example when this
+    # procedure is invoked from too shallow a call depth), it returns an
+    # empty string rather than propagating an error.
+    #
+    # Arguments:
+    #   None.
+    #
+    # Results:
+    #   The name of the procedure that called the immediate caller of this
+    #   procedure, or the empty string if the call stack is too shallow to
+    #   contain such a frame.
+    # </help>
+
     #
     # NOTE: This procedure returns the name of the procedure
     #       that called our caller, hence the minus two value
@@ -66,6 +132,52 @@ namespace eval ::Eagle {
   }
 
   proc cleanupForWatchCat { {quiet false} } {
+    # <help>
+    # This procedure tears down whatever state the WatchCat tooling has
+    # established at the interpreter level so that the next test run (or
+    # the eventual disposal of the interpreter) starts from a clean slate.
+    # In particular, if an external log monitor child process is currently
+    # recorded, it forcibly kills that process; in all cases it then drops
+    # the WatchCat-related elements out of the global eagle_debugger array
+    # so that the next call into the hooking layer will rediscover its
+    # configuration from scratch.  It is used by the pre-dispose callback
+    # (to ensure cleanup at interpreter shutdown) and by the [newTestLog]
+    # override (to abandon a monitor that is watching a log file the test
+    # framework has just rotated away from).
+    #
+    # How it works: it uses [checkProcessIdForWatchCat] to read and unset
+    # the recorded child process identifier, then asks the core [kill]
+    # command to terminate that process with force.  Either outcome (a
+    # successful kill, a failed kill, or no recorded process at all) is
+    # reported to the host result channel unless quiet mode is in effect.
+    # All of the conditional reporting is wrapped in a [try] whose
+    # [finally] block performs the eagle_debugger array hygiene, so the
+    # element cleanup runs even if an unexpected error escapes the body.
+    # The finally clause also defensively detects and clears a leftover
+    # process-id element under a hack label, because that element should
+    # already have been unset by the helper above and its persistence is
+    # treated as a stale-state anomaly worth reporting.
+    #
+    # Tricky details: when reporting the killed-process message, the
+    # process id is re-stored into "pid" via [set pid $pid] -- this odd
+    # idiom captures the post-[kill] value of the local variable into the
+    # message construction in a single expression so the trace is built
+    # in the same statement as the kill itself.  The [appendArgs] used
+    # everywhere is the WatchCat house style for building diagnostic
+    # strings without manual quoting.
+    #
+    # Arguments:
+    #   quiet -- Optional boolean (default false).  When true, all of the
+    #            informational host-result messages are suppressed; the
+    #            kill and cleanup work is still performed and the boolean
+    #            return value is still produced.
+    #
+    # Results:
+    #   True if an external log monitor process was recorded and was
+    #   successfully killed; false in every other case (no recorded
+    #   process, kill failed, or only stale state was cleaned up).
+    # </help>
+
     try {
       if {[checkProcessIdForWatchCat pid true]} then {
         if {[catch {
@@ -117,6 +229,42 @@ namespace eval ::Eagle {
   }
 
   proc isHookedGetTestLogForWatchCat { hooked } {
+    # <help>
+    # This procedure inspects the current set of defined procedures to
+    # decide whether the WatchCat override of the core [getTestLog] helper
+    # is currently installed (or, conversely, whether the WatchCat hook is
+    # currently dormant and the original [getTestLog] is in place).  It is
+    # the gate used by the hook/unhook routine to refuse to act when the
+    # interpreter is already in the requested state, avoiding double-hooks
+    # and accidental renames of unrelated procedures with similar names.
+    #
+    # How it works: it examines three procedure names -- the public
+    # [getTestLog] (always expected to exist in either configuration), the
+    # backup name [__getTestLog] (which only exists while the hook is
+    # installed, because hooking renames the original out of the way), and
+    # the source name [getTestLogForWatchCat] (which only exists while the
+    # hook is NOT installed, because hooking renames it onto [getTestLog]).
+    # In the hooked configuration the backup name is present and the
+    # source name is absent; in the unhooked configuration the inverse is
+    # true.
+    #
+    # Tricky details: this is a true tri-state check.  Both of its return
+    # paths can legitimately yield false even though one of the two states
+    # ought to be true at any given time, because the interpreter may be
+    # in a transient or corrupted state in which neither answer holds.  In
+    # that situation it is up to the caller to decide what to do.
+    #
+    # Arguments:
+    #   hooked -- A boolean.  When true, the procedure asks "is the hook
+    #             currently installed?"; when false, it asks "is the hook
+    #             currently NOT installed (and therefore eligible to be
+    #             installed)?".
+    #
+    # Results:
+    #   True if the interpreter is in the configuration named by "hooked",
+    #   false otherwise.
+    # </help>
+
     if {$hooked} then {
       if {[llength [info procs getTestLog]] > 0 && \
           [llength [info procs __getTestLog]] > 0 && \
@@ -136,6 +284,55 @@ namespace eval ::Eagle {
 
   proc hookGetTestLogForWatchCat {
           enable {failSafe ""} {strict false} {quiet false} } {
+    # <help>
+    # This procedure installs or removes the WatchCat override of the core
+    # script library [getTestLog] command.  It is the primary public entry
+    # point for activating the log monitor's interception of the test
+    # framework's log-file selection logic; while the hook is installed,
+    # every call to [getTestLog] passes through [getTestLogForWatchCat],
+    # which in turn launches the external log monitor process the first
+    # time a test log path is requested.
+    #
+    # How it works: when the failSafe argument is a strict boolean, that
+    # value is first recorded into the WatchCat eagle_debugger element so
+    # that subsequent [isFailSafeForWatchCat] queries see it.  When the
+    # enable argument is true and the interpreter is in the unhooked
+    # configuration, the existing [getTestLog] is renamed to [__getTestLog]
+    # to preserve it, and [getTestLogForWatchCat] is renamed onto
+    # [getTestLog] to take its place.  When enable is false and the
+    # interpreter is in the hooked configuration, the inverse rename pair
+    # is performed.  Either operation is no-op-and-warn if the interpreter
+    # is not in the corresponding starting state, and the warning is
+    # either raised as an error or printed to the host result channel
+    # depending on the strict flag.
+    #
+    # Tricky details: the failSafe argument must pass [string is boolean
+    # -strict] to be recorded; passing an empty string (the default) leaves
+    # the current fail-safe setting unchanged, which is how callers can
+    # toggle the hook without touching that configuration.  The double
+    # underscore prefix on the saved name is the convention this script
+    # uses to identify "saved original" copies of overridden procedures.
+    #
+    # Arguments:
+    #   enable   -- A boolean.  When true, install the hook; when false,
+    #               remove the hook and restore the original [getTestLog].
+    #   failSafe -- Optional.  A strict boolean to record as the new
+    #               fail-safe setting, or an empty string (the default) to
+    #               leave the existing fail-safe setting alone.
+    #   strict   -- Optional boolean (default false).  When true, a hook or
+    #               unhook attempt that cannot proceed because the
+    #               interpreter is already in the requested state raises an
+    #               error instead of merely reporting via host result.
+    #   quiet    -- Optional boolean (default false).  When true, the
+    #               informational host-result messages emitted on success
+    #               or non-strict failure are suppressed.
+    #
+    # Results:
+    #   True if the requested hook or unhook operation was performed; false
+    #   if the operation was skipped because the interpreter was already in
+    #   the requested state and strict mode was not in effect.
+    # </help>
+
     if {[string is boolean -strict $failSafe]} then {
       set ::eagle_debugger(watchCatFailSafe) $failSafe
     }
@@ -184,6 +381,33 @@ namespace eval ::Eagle {
   }
 
   proc isHookedNewTestLogForWatchCat { hooked } {
+    # <help>
+    # This procedure decides whether the WatchCat override of the core
+    # script library [newTestLog] command is currently installed.  It is
+    # the [newTestLog] companion to [isHookedGetTestLogForWatchCat] and
+    # exists for the same reason -- to let the hooking routine reject
+    # operations that would corrupt the rename chain.
+    #
+    # How it works: it checks the public [newTestLog] name (present in
+    # either state), the saved-original name [__newTestLog] (present only
+    # when the hook is installed) and the source name
+    # [newTestLogForWatchCat] (present only when the hook is not
+    # installed), using the lengths returned by [info procs] for each.
+    # In the hooked state the saved name exists and the source name does
+    # not; in the unhooked state the inverse holds.
+    #
+    # Arguments:
+    #   hooked -- A boolean selecting which configuration is being tested
+    #             for.  True asks "is the WatchCat hook installed?", false
+    #             asks "is the WatchCat hook absent and therefore eligible
+    #             to be installed?".
+    #
+    # Results:
+    #   True if the interpreter is in the configuration named by "hooked",
+    #   false otherwise (including transient or corrupted states where
+    #   neither configuration matches).
+    # </help>
+
     if {$hooked} then {
       if {[llength [info procs newTestLog]] > 0 && \
           [llength [info procs __newTestLog]] > 0 && \
@@ -202,6 +426,45 @@ namespace eval ::Eagle {
   }
 
   proc hookNewTestLogForWatchCat { enable {strict false} {quiet false} } {
+    # <help>
+    # This procedure installs or removes the WatchCat override of the core
+    # script library [newTestLog] command.  Doing so allows the WatchCat
+    # tooling to react when the test framework rotates to a new log file
+    # (for example, between sub-runs of a long-running test driver), by
+    # killing the external log monitor that was bound to the previous
+    # file so that the next [getTestLog] call can start a fresh monitor
+    # for the new file.
+    #
+    # How it works: when enable is true and the interpreter is in the
+    # unhooked configuration, [newTestLog] is renamed to [__newTestLog]
+    # to preserve the original, and [newTestLogForWatchCat] is renamed
+    # onto [newTestLog] to take its place.  When enable is false and the
+    # interpreter is in the hooked configuration, the inverse renames are
+    # performed.  Either operation is no-op-and-warn if the precondition
+    # is not met; whether the warning is raised as an error or merely
+    # printed depends on the strict flag.
+    #
+    # Tricky details: unlike its [getTestLog] counterpart, this routine
+    # has no failSafe parameter -- the fail-safe behavior is shared state
+    # set by the [getTestLog] hook and consulted from elsewhere.
+    #
+    # Arguments:
+    #   enable -- A boolean.  When true, install the hook; when false,
+    #             remove the hook and restore the original [newTestLog].
+    #   strict -- Optional boolean (default false).  When true, a hook or
+    #             unhook attempt that cannot proceed because the
+    #             interpreter is already in the requested state raises an
+    #             error rather than printing a diagnostic message.
+    #   quiet  -- Optional boolean (default false).  When true, the
+    #             informational host-result messages emitted on success or
+    #             non-strict failure are suppressed.
+    #
+    # Results:
+    #   True if the requested hook or unhook operation was performed; false
+    #   if the operation was skipped because the interpreter was already in
+    #   the requested state and strict mode was not in effect.
+    # </help>
+
     if {$enable} then {
       if {[isHookedNewTestLogForWatchCat false]} then {
         rename newTestLog __newTestLog; # save original
@@ -246,6 +509,42 @@ namespace eval ::Eagle {
   }
 
   proc hookPreDisposeCallbackForWatchCat { enable {quiet false} } {
+    # <help>
+    # This procedure attaches or detaches the WatchCat dispose-callback to
+    # the active interpreter's PreInterpreterDisposed event.  It is the
+    # bridge that lets [preDisposeCallbackForWatchCat] run automatically
+    # at interpreter shutdown so the WatchCat-installed state can be torn
+    # down without explicit cooperation from the test driver.
+    #
+    # How it works: it obtains an aliased object handle for the active
+    # interpreter, names the callback (the script-level procedure
+    # [preDisposeCallbackForWatchCat]) as the value to be added or
+    # removed, and uses the NonPublic accessor flag (because the event's
+    # add and remove members are not public) to first call
+    # remove_PreInterpreterDisposed -- which makes the operation
+    # idempotent by clearing any prior registration of the same callback
+    # before optionally re-adding it -- and then, if enable is true,
+    # call add_PreInterpreterDisposed to install it.
+    #
+    # Tricky details: when there is no active interpreter object handle
+    # available (i.e. [isNonNullObjectHandle] returns false), the routine
+    # silently does nothing; this can occur very early during startup or
+    # very late during shutdown, neither of which is an error condition
+    # for this hook.  The status messages distinguish between the hook
+    # and unhook paths even though both code paths first unconditionally
+    # remove any prior registration.
+    #
+    # Arguments:
+    #   enable -- A boolean.  When true, register the callback; when
+    #             false, only remove any existing registration.
+    #   quiet  -- Optional boolean (default false).  When true, suppress
+    #             the informational host-result messages.
+    #
+    # Results:
+    #   None.  All effects are produced via the interpreter object's
+    #   event-handler list.
+    # </help>
+
     set interpreter [object invoke -alias Interpreter GetActive]
 
     if {[isNonNullObjectHandle $interpreter]} then {
@@ -270,6 +569,29 @@ namespace eval ::Eagle {
   }
 
   proc isFailSafeForWatchCat {} {
+    # <help>
+    # This procedure reports whether the WatchCat tooling is currently in
+    # "fail-safe" mode.  Fail-safe mode tells the launch decision logic
+    # to allow a replacement external log monitor to be started even when
+    # a process id is still recorded from a previous monitor, provided
+    # that recorded process is no longer running.  It is configured by
+    # passing a boolean failSafe to [hookGetTestLogForWatchCat], which
+    # stores the value into the eagle_debugger array.
+    #
+    # How it works: it reads the watchCatFailSafe element of the global
+    # eagle_debugger array (if present), and returns its value if and
+    # only if that value is a syntactically valid boolean.  If the
+    # element is missing or unparseable, false is returned, which is the
+    # safest default because it disables the automatic restart behavior.
+    #
+    # Arguments:
+    #   None.
+    #
+    # Results:
+    #   True if fail-safe mode is currently enabled and the stored value
+    #   is a valid boolean; false otherwise.
+    # </help>
+
     if {[info exists ::eagle_debugger(watchCatFailSafe)]} then {
       set value $::eagle_debugger(watchCatFailSafe)
 
@@ -282,6 +604,44 @@ namespace eval ::Eagle {
   }
 
   proc checkProcessIdForWatchCat { {varName ""} {unset false} } {
+    # <help>
+    # This procedure queries whether the WatchCat tooling currently knows
+    # about a previously launched external log monitor process and, on
+    # demand, exposes that process id to the caller and/or removes it
+    # from the global tracking array.  It is used both by [cleanupForWatchCat]
+    # (to obtain and then forget the id while preparing to kill the
+    # process) and by [shouldExecForWatchCat] (to learn whether a monitor
+    # is already running so a new one is not launched accidentally).
+    #
+    # How it works: when varName is non-empty, an [upvar 1] alias named
+    # "pid" is bound to that variable in the caller's frame.  The
+    # watchCatProcessId element of the global eagle_debugger array is
+    # then examined; if it is present, its value is copied into the
+    # local pid alias (which propagates back to the caller's variable),
+    # the element is optionally unset based on the "unset" flag, and
+    # true is returned.  If the element is missing, false is returned
+    # and no caller variable is written.
+    #
+    # Tricky details: when varName is the empty string the [upvar] is
+    # skipped, but the local pid variable still exists from the
+    # subsequent [set]; that local copy is simply discarded when the
+    # procedure returns.  Because of that, callers can use this routine
+    # purely as an "is one recorded?" predicate by passing an empty
+    # varName.
+    #
+    # Arguments:
+    #   varName -- Optional (default empty).  When non-empty, the name of
+    #              a variable in the caller's frame that will receive the
+    #              recorded process id on a true return.
+    #   unset   -- Optional boolean (default false).  When true and a
+    #              process id was found, the watchCatProcessId element is
+    #              also removed from the eagle_debugger array.
+    #
+    # Results:
+    #   True if a process id was recorded (regardless of whether it was
+    #   also unset); false if no id was recorded.
+    # </help>
+
     if {[string length $varName] > 0} then {
       upvar 1 $varName pid
     }
@@ -300,6 +660,30 @@ namespace eval ::Eagle {
   }
 
   proc isOfficialStableReleaseInProgressForWatchCat {} {
+    # <help>
+    # This procedure is a defensive wrapper around the core helper
+    # [isOfficialStableReleaseInProgress] that returns false when that
+    # helper is unavailable in the current interpreter, rather than
+    # failing with "invalid command name".  It is consulted by the
+    # command-builder for the external log monitor so that, while an
+    # official stable release is in progress, the monitor is configured
+    # to operate in report-only mode (and refrain from killing the
+    # tested process even when it appears hung).
+    #
+    # How it works: it tests whether the core command name exists via
+    # [info commands] and only forwards the call when it does; in any
+    # other interpreter (older Eagle builds, alternate distributions, or
+    # Tcl) it conservatively returns false so that release-time guards
+    # are simply not applied.
+    #
+    # Arguments:
+    #   None.
+    #
+    # Results:
+    #   True if the underlying core helper exists and reports that an
+    #   official stable release is in progress; false otherwise.
+    # </help>
+
     if {[llength [info commands \
         isOfficialStableReleaseInProgress]] == 0} then {
       return false
@@ -309,6 +693,29 @@ namespace eval ::Eagle {
   }
 
   proc getTestChannelOrDefaultForWatchCat { {channel stdout} } {
+    # <help>
+    # This procedure is a defensive wrapper around the core test helper
+    # [getTestChannelOrDefault] that simply returns the supplied default
+    # channel name when the core helper is unavailable.  Its purpose is to
+    # let the WatchCat hook code choose a destination for diagnostic
+    # tracing without taking a hard dependency on the Eagle test package
+    # being loaded.
+    #
+    # How it works: it checks via [info commands] whether the core helper
+    # is defined and, if not, returns the channel name supplied by the
+    # caller verbatim.  When the helper is defined, it forwards the call
+    # and returns whatever the helper returns (which may be a different
+    # channel name selected by the test framework's current configuration).
+    #
+    # Arguments:
+    #   channel -- Optional (default "stdout").  The fallback channel name
+    #              returned when the core helper is not available.
+    #
+    # Results:
+    #   The channel name selected by the core helper, or the fallback
+    #   channel name when the helper is unavailable.
+    # </help>
+
     if {[llength [info commands getTestChannelOrDefault]] == 0} then {
       return $channel
     }
@@ -317,6 +724,31 @@ namespace eval ::Eagle {
   }
 
   proc setupTestRunTagForWatchCat { {channel stdout} {quiet false} } {
+    # <help>
+    # This procedure is a defensive wrapper around the core helper
+    # [setupTestRunTag], which seeds the per-test-run identifier embedded
+    # in the HTTP User-Agent header used for remote logging.  Calling
+    # this from the WatchCat [getTestLog] hook makes sure that, once a
+    # test log is selected, the test run tag is in place before any
+    # subsequent code emits remote events tied to that run.
+    #
+    # How it works: it checks via [info commands] whether the underlying
+    # helper exists, returning false when it does not so the caller knows
+    # nothing was set up.  When it does exist, the call is forwarded
+    # verbatim with the supplied channel and quiet arguments, and its
+    # return value is returned.
+    #
+    # Arguments:
+    #   channel -- Optional (default "stdout").  The channel name to
+    #              forward to the core helper for any diagnostic output.
+    #   quiet   -- Optional boolean (default false).  Forwarded verbatim
+    #              to the core helper to suppress its trace messages.
+    #
+    # Results:
+    #   Whatever [setupTestRunTag] returned when present; false when the
+    #   core helper is not available.
+    # </help>
+
     if {[llength [info commands setupTestRunTag]] == 0} then {
       return false
     }
@@ -325,6 +757,45 @@ namespace eval ::Eagle {
   }
 
   proc shouldExecForWatchCat {} {
+    # <help>
+    # This procedure decides whether the WatchCat [getTestLog] hook
+    # should launch a fresh external log monitor child process at this
+    # moment.  It is the central gate that prevents accidental double
+    # launches, prevents launches from non-Eagle shells, and (when
+    # fail-safe mode is enabled) permits a replacement launch after a
+    # previously recorded monitor has died.
+    #
+    # How it works: it first honors the per-interpreter opt-out via the
+    # global no(shouldExecForWatchCat) element, returning false when that
+    # element is set.  Next, as a bug fix, it refuses to launch when the
+    # current shell executable name does not match the well-known regex
+    # for Eagle's own shells (EagleKit, EagleShell, the bare "Eagle"
+    # form, optional 32/64 width suffixes, and either the dll or exe
+    # extension); this protects unrelated Tcl-based hosts from
+    # inadvertently spawning a nested Eagle shell.  Then, if no process
+    # id is recorded at all, true is returned because there is plainly
+    # no monitor running.  When an id is recorded, the answer depends on
+    # whether fail-safe mode is in effect: if not, return false (one
+    # monitor is sufficient); if yes, return true only when the recorded
+    # process is no longer running (which means the previous monitor
+    # crashed or exited and a replacement is needed).
+    #
+    # Tricky details: the regular expression for the shell executable
+    # name accepts the case-sensitive prefix "Eagle" followed by an
+    # optional "Kit" or "Shell" suffix and then an optional bit-width
+    # suffix; it is anchored on both sides and matches only the file
+    # tail.  The fall-through default at the end of the procedure is
+    # false, so any combination not explicitly approved above results in
+    # a no-launch decision.
+    #
+    # Arguments:
+    #   None.
+    #
+    # Results:
+    #   True if it is safe and appropriate to launch a new external log
+    #   monitor process now; false if the launch must be skipped.
+    # </help>
+
     if {[info exists ::no(shouldExecForWatchCat)]} then {
       return false
     }
@@ -356,6 +827,29 @@ namespace eval ::Eagle {
   }
 
   proc getPathForWatchCat {} {
+    # <help>
+    # This procedure returns the root directory used as a fallback search
+    # location for the WatchCat tool script file.  It is consulted by
+    # [getFileNameForWatchCat] when neither of the more specific
+    # environment variables (XDG_WATCHCAT_HOME or XDG_STARTUP_HOME) is
+    # set, so it represents the last-resort location of the script.
+    #
+    # How it works: it reads the SCRATCH_ROOT environment variable,
+    # raising a descriptive error if that variable is not set; it then
+    # verifies via [file exists] and [file isdirectory] that the named
+    # path actually refers to an existing directory, raising another
+    # descriptive error if the value is unusable.  On success the
+    # validated directory path is returned.
+    #
+    # Arguments:
+    #   None.
+    #
+    # Results:
+    #   The validated directory path read from SCRATCH_ROOT.  This
+    #   procedure does not return on failure; it raises a script error
+    #   instead.
+    # </help>
+
     if {![info exists ::env(SCRATCH_ROOT)]} then {
       error "environment variable SCRATCH_ROOT not found"
     }
@@ -370,6 +864,36 @@ namespace eval ::Eagle {
   }
 
   proc getFileNameForWatchCat { path } {
+    # <help>
+    # This procedure resolves the absolute file name of the external log
+    # monitor tool script (watchCat.tool.eagle) used as the entry point
+    # for the child Eagle shell that the WatchCat tooling launches.  It
+    # exists so that callers do not need to know the layout of the
+    # WatchCat distribution tree -- this routine prefers the most
+    # specific override available and falls back to a generic location
+    # only when no override is set.
+    #
+    # How it works: the tail file name is fixed as watchCat.tool.eagle.
+    # The XDG_WATCHCAT_HOME environment variable, if present, points
+    # directly at the directory containing that file; the
+    # XDG_STARTUP_HOME variable, if present, names the root of the
+    # startup tree and the file is found beneath the
+    # Scripts/Public/WatchCat sub-tree below it.  When neither is set,
+    # the supplied path argument (typically the SCRATCH_ROOT directory
+    # validated by [getPathForWatchCat]) is used as the directory.  In
+    # every case the resulting path is run through [file normalize] to
+    # produce a clean absolute path.
+    #
+    # Arguments:
+    #   path -- The fallback directory in which to look for the tool
+    #           script when neither XDG_WATCHCAT_HOME nor
+    #           XDG_STARTUP_HOME is defined.
+    #
+    # Results:
+    #   The normalized absolute file name of the watchCat.tool.eagle
+    #   script as derived from the first matching source.
+    # </help>
+
     set fileNameOnly watchCat.tool.eagle
 
     if {[info exists ::env(XDG_WATCHCAT_HOME)]} then {
@@ -385,6 +909,52 @@ namespace eval ::Eagle {
   }
 
   proc getCommandForWatchCat { scriptFileName logFileName } {
+    # <help>
+    # This procedure builds (and caches) the command that the WatchCat
+    # tooling uses to spawn an external log monitor child process for a
+    # given target log file.  The result is a list suitable for passing
+    # to [eval] (or [catch]) that runs a nested Eagle shell with the
+    # watchCat.tool.eagle script loaded, the parent process id passed in
+    # as an argument, and a small pre-initialize script that configures
+    # the monitor's run-time options based on optional overrides stored
+    # in the eagle_debugger array.
+    #
+    # How it works: it first checks whether a previously computed
+    # command is cached in eagle_debugger(watchCatCommand) and returns
+    # that immediately when it is.  Otherwise it builds up a
+    # pre-initialize script as a single line of statements separated by
+    # the "; " sequence -- starting empty, then appending a [set
+    # no(killHungProcess) 1] guard when an official stable release is in
+    # progress, and finally appending [set limit ...], [set aggressive
+    # ...], and [set verbose ...] statements for each watchCatLimit,
+    # watchCatAggressive, and watchCatVerbose override that is present.
+    # The completed pre-initialize script is then embedded into an
+    # [execShell] command line along with the -file argument naming the
+    # tool script, the target log file name, the parent process id (from
+    # the [pid] core command), and the trailing background indicator,
+    # all stored back into eagle_debugger(watchCatCommand) for reuse.
+    #
+    # Tricky details: every embedded value is quoted using [appendArgs
+    # \" ... \"] so that the resulting command list contains proper
+    # literal quoting that survives the [execShell] interpretation
+    # layer.  The -nopreviousprocessid option is included on the
+    # assumption of a modern Eagle build; the calling code is prepared
+    # to retry without it when the option is rejected by an older shell.
+    # Because the entire command is cached on first use, all overrides
+    # take effect only when first observed -- subsequent toggling of
+    # the override array elements is ignored until the cache is dropped.
+    #
+    # Arguments:
+    #   scriptFileName -- Absolute file name of the watchCat.tool.eagle
+    #                     tool script that the child shell will load.
+    #   logFileName    -- Absolute file name of the test log file that
+    #                     the spawned child should monitor.
+    #
+    # Results:
+    #   A list value containing the executable name and arguments needed
+    #   to start the external log monitor as a background child process.
+    # </help>
+
     #
     # NOTE: If the script command used to start the external
     #       log monitor is not yet setup, do that now.
@@ -466,6 +1036,49 @@ namespace eval ::Eagle {
   }
 
   proc canHasDefaultTestLogForWatchCat { caller varName } {
+    # <help>
+    # This procedure decides whether, when the original [getTestLog]
+    # returned an empty string, the WatchCat hook should fall back to
+    # the default test log instead of treating the empty result as an
+    # error.  It exists to permit specific well-known callers (currently
+    # only [tlog]) to keep working when no log file has been explicitly
+    # configured, while not silently inventing a log file for any other
+    # caller.
+    #
+    # How it works: it remembers, on a per-call-frame-name basis via a
+    # hack-labeled element in the global eagle_debugger array, that this
+    # routine has previously returned a default log for the current
+    # level; on a subsequent call from the same level it returns true
+    # without consulting the caller name, on the theory that the caller
+    # may have just explicitly cleared its log selection and we should
+    # not redo the default lookup.  On the first call it requires the
+    # trimmed caller name to be exactly "tlog", in which case it loads
+    # the Eagle.Test package, asks [getDefaultTestLog] for the default
+    # log path, caches the value into the eagle_debugger element, and
+    # writes it through the optional upvar alias to the caller's
+    # variable named by varName.  Any other caller produces a false
+    # return and no cached state.
+    #
+    # Tricky details: the eagle_debugger element key is the fully
+    # qualified name of this procedure as obtained via [info level
+    # [info level]], which is intentional because it produces a unique
+    # well-known key under namespace evaluation.  When varName is empty
+    # the upvar is skipped entirely.
+    #
+    # Arguments:
+    #   caller  -- The name of the procedure that originally invoked
+    #              the WatchCat [getTestLog] hook, as discovered by
+    #              [getCallerNameForWatchCat].
+    #   varName -- Optional name of a variable in the caller's frame
+    #              that will receive the resolved default log path on a
+    #              true return.  An empty string suppresses the write.
+    #
+    # Results:
+    #   True if a default log was returned (now or previously), in
+    #   which case the named variable also holds that log path; false
+    #   if no default log is available for this caller.
+    # </help>
+
     if {[string length $varName] > 0} then {
       upvar 1 $varName log
     }
@@ -493,6 +1106,49 @@ namespace eval ::Eagle {
   }
 
   proc newTestLogForWatchCat { oldFileName newFileName } {
+    # <help>
+    # This procedure is the WatchCat override of the core
+    # [newTestLog] command.  While the WatchCat hook on [newTestLog] is
+    # installed, this routine receives notification whenever the test
+    # framework rotates from one log file to another -- for example
+    # between System.Data.SQLite test sub-runs.  Because there is no
+    # current IPC channel by which the running external log monitor
+    # could be told to start watching a different file, this procedure
+    # simply kills the existing monitor; the next call into the
+    # [getTestLog] hook will then start a fresh monitor bound to the
+    # newly selected log file (and the fail-safe mode, when enabled,
+    # will guarantee that even an early next call is permitted to do so).
+    #
+    # How it works: it emits a host result message announcing the new
+    # log file name, then opportunistically asks the Eagle.Test package
+    # to remove any newly empty temporary sub-directories beneath the
+    # old log file's directory (so that rotation does not leave behind
+    # empty per-day or per-temp folders).  The cleanup call is wrapped
+    # in [catch] so that any failure (including the package being
+    # unavailable) is silently ignored.  Finally [cleanupForWatchCat]
+    # is invoked to terminate the existing monitor child process and
+    # drop the WatchCat eagle_debugger state, freeing the next call to
+    # [getTestLog] to launch a replacement.
+    #
+    # Tricky details: this routine does NOT call through to the saved
+    # [__newTestLog] -- the rotation effect is purely about WatchCat's
+    # own bookkeeping, and the test framework is expected to handle
+    # any cross-cutting concerns of its own elsewhere.
+    #
+    # Arguments:
+    #   oldFileName -- The path of the test log file the framework is
+    #                  rotating away from.  Its parent directory is
+    #                  scanned for empty temporary sub-directories.
+    #   newFileName -- The path of the new test log file the framework
+    #                  is rotating to.  It is included in the host
+    #                  result notification.
+    #
+    # Results:
+    #   None.  All effects are produced via side effects -- the host
+    #   result message, the optional sub-directory cleanup, and the
+    #   monitor process termination.
+    # </help>
+
     #
     # HACK: Since there is direct no way to communicate the
     #       new log file name (System.Data.SQLite?) to the
@@ -525,6 +1181,66 @@ namespace eval ::Eagle {
   }
 
   proc getTestLogForWatchCat {} {
+    # <help>
+    # This procedure is the WatchCat override of the core
+    # [getTestLog] command.  While the WatchCat hook on [getTestLog] is
+    # installed, every test-framework call asking "what log file should
+    # this test run write to?" passes through here.  Its primary job is
+    # to remain a transparent shim -- delegating to the saved original
+    # implementation and returning that result unchanged -- while also
+    # opportunistically launching an external log monitor child process
+    # that will watch the resulting log file for hangs and report or
+    # kill the parent test process if it stops making progress.
+    #
+    # How it works: it determines the caller name (used for diagnostics
+    # and to gate fallback behavior), then invokes the saved
+    # [__getTestLog] (raising an error with the caller name if the
+    # saved copy is missing).  An empty result is permitted only when
+    # [canHasDefaultTestLogForWatchCat] succeeds in supplying a default
+    # log; any other empty result is treated as an error attributed to
+    # the caller.  Once a non-empty log path is in hand, it picks a
+    # diagnostic channel via [getTestChannelOrDefaultForWatchCat] and
+    # asks [setupTestRunTagForWatchCat] to make sure the per-run tag
+    # used in remote logging headers is established (quietly, to keep
+    # noisy stress tests from drowning the test log).  Then, if
+    # [shouldExecForWatchCat] approves, it resolves the tool script
+    # path via [getPathForWatchCat] and [getFileNameForWatchCat],
+    # builds a launch command via [getCommandForWatchCat], registers
+    # the pre-dispose cleanup callback (unless persistence mode is
+    # selected), and executes the launch command in a [catch].  On
+    # first failure it patches the command to drop the
+    # -nopreviousprocessid option (which older Eagle builds do not
+    # understand) and retries, recording the new child's process id in
+    # eagle_debugger(watchCatProcessId).  The launch result is logged
+    # to both the diagnostic channel and the host result channel.
+    # Whether or not the launch was attempted or succeeded, the
+    # original log path is returned so the calling test code is
+    # unaware of the monitor's presence.
+    #
+    # Tricky details: the launch command is invoked via the [catch
+    # $command varName] form, which captures the child process id
+    # into watchCatProcessId for later cleanup.  The
+    # persistence-vs-cleanup decision is made by checking the existence
+    # of eagle_debugger(watchCatPersistent); when present, the
+    # dispose-time cleanup callback is intentionally NOT installed so
+    # the monitor outlives the interpreter.  The [setupTestRunTag] call
+    # passes true for its quiet argument because stress tests with many
+    # threads can otherwise produce a flood of remote-tag chatter; the
+    # accompanying comment marks this as a tradeoff specific to the
+    # System.Data.SQLite test environment.
+    #
+    # Arguments:
+    #   None.  This procedure's signature must match the saved
+    #   [__getTestLog] it is replacing.
+    #
+    # Results:
+    #   The log file path produced by the saved [__getTestLog]
+    #   (possibly substituted with the default log when permitted by
+    #   [canHasDefaultTestLogForWatchCat]).  Returns by raising an
+    #   error if the saved helper is missing or its result cannot be
+    #   resolved to a usable log path.
+    # </help>
+
     set caller [getCallerNameForWatchCat]
 
     if {[llength [info procs __getTestLog]] == 0} then {
