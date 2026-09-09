@@ -19,8 +19,9 @@ if {![package vsatisfies [package provide Eagle] 1.0]} then {return}
 
 ###############################################################################
 
-package ifneeded Eagle.WatchCat 1.0 \
-    [list source -library true -- [file join $dir watchCat.eagle]]
+package ifneeded Eagle.WatchCat 1.0 [list \
+    source -library true -package true -- \
+    [file join $dir watchCat.eagle]]
 
 ###############################################################################
 
@@ -32,7 +33,7 @@ apply [list [list dir tag] {
   if {[info exists ::eagle_platform(patchLevel)] && \
       [package vcompare $::eagle_platform(patchLevel) \
       $patchLevel] > 0} then {
-    lappend command -library true
+    lappend command -library true -package true
   }
 
   lappend command -- $fileName
